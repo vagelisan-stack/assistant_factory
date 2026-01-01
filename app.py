@@ -1,4 +1,5 @@
 import os
+import hashlib
 import time
 from pathlib import Path
 from collections import defaultdict, deque
@@ -212,6 +213,23 @@ def chat():
 
     except Exception as e:
         return jsonify(error=str(e)), 500
+@app.get("/admin_check")
+def admin_check():
+    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+    provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
+
+    def sha12(s: str) -> str:
+        if not s:
+            return ""
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    return jsonify(
+        match=(expected == provided and expected != ""),
+        expected_len=len(expected),
+        provided_len=len(provided),
+        expected_sha12=sha12(expected),
+        provided_sha12=sha12(provided),
+    )
 
 
 # ---------- Local dev only ----------
