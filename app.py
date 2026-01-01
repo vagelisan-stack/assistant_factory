@@ -15,7 +15,12 @@ def _routes():
     return jsonify(sorted([f"{r.methods} {r.rule}" for r in app.url_map.iter_rules()]))
 
 
-STORE = AssistantStore(base_dir=r"C:\mistral_tests\assistant_factory\assistants")
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent
+ASSISTANTS_DIR = Path(os.getenv("ASSISTANTS_DIR", BASE_DIR / "assistants"))
+STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
+
 print("CWD:", os.getcwd())
 print("ASSISTANTS_DIR env:", os.getenv("ASSISTANTS_DIR"))
 print("Loaded assistants:", [a.assistant_id for a in STORE.list(enabled_only=False)])
