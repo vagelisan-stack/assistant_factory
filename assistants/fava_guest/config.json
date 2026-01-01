@@ -1,0 +1,7 @@
+﻿{
+  "name": "Fava Guest",
+  "enabled": true,
+  "model": "mistral-large-latest",
+  "temperature": 0.2,
+  "max_tokens": 600
+}
