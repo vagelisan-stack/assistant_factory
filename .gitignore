@@ -1,0 +1,14 @@
+# secrets
+.env
+.env.*
+
+# runtime data (DB, assistants on disk, logs, backups)
+data/
+*.db
+backups/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
