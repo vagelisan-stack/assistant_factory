@@ -1,10 +1,12 @@
 import os
+import time
 from pathlib import Path
+from collections import defaultdict, deque
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
-# Load .env ONCE, early, and override any old env vars (important for Render)
+# Load .env ONCE, early, and override any old env vars
 load_dotenv(override=True)
 
 from assistant_store import AssistantStore
@@ -13,12 +15,12 @@ from llm_client import MistralClient, LLMError
 # ---------- Paths / Store (Render-safe) ----------
 BASE_DIR = Path(__file__).resolve().parent
 ASSISTANTS_DIR = Path(os.getenv("ASSISTANTS_DIR") or (BASE_DIR / "assistants"))
-
 STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
 
 # ---------- Flask ----------
 app = Flask(__name__)
-app.json.ensure_ascii = False  # allow Greek in JSON
+app.json.ensure_ascii = False  # allow Greek in JSON responses
+
 
 @app.after_request
 def force_utf8(resp):
@@ -28,12 +30,55 @@ def force_utf8(resp):
     return resp
 
 
+# ---------- Admin protection (for private endpoints like /reload) ----------
+def require_admin_key():
+    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+    if not expected:
+        # If not set, don't block (useful for local dev)
+        return None
+    provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
+    if provided != expected:
+        return jsonify(error="Unauthorized"), 401
+    return None
+
+
+# ---------- Public anti-abuse (rate limiting for /chat) ----------
+RATE = defaultdict(lambda: deque())
+WINDOW_SECONDS = int(os.getenv("RL_WINDOW_SECONDS", "60"))
+MAX_REQ_PER_WINDOW = int(os.getenv("RL_MAX_REQ", "20"))
+
+
+def get_client_ip() -> str:
+    # Render / proxies usually provide X-Forwarded-For
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.remote_addr or "unknown").strip()
+
+
+def rate_limited():
+    ip = get_client_ip()
+    now = time.time()
+    q = RATE[ip]
+
+    while q and now - q[0] > WINDOW_SECONDS:
+        q.popleft()
+
+    if len(q) >= MAX_REQ_PER_WINDOW:
+        return jsonify(error="Too many requests, slow down."), 429
+
+    q.append(now)
+    return None
+
+
 # ---------- Helpers ----------
 def _assistant_id(a):
     return getattr(a, "assistant_id", getattr(a, "id", None))
 
+
 def _assistant_enabled(a):
     return bool(getattr(a, "enabled", False))
+
 
 def _assistant_to_dict(a):
     return {
@@ -44,6 +89,7 @@ def _assistant_to_dict(a):
         "temperature": getattr(a, "temperature", None),
         "max_tokens": getattr(a, "max_tokens", None),
     }
+
 
 def _get_assistant(assistant_id: str):
     # Prefer STORE.get(...) if it exists
@@ -58,8 +104,8 @@ def _get_assistant(assistant_id: str):
             return a
     return None
 
+
 def _get_prompt_and_knowledge(a):
-    # Be tolerant to different attribute names
     prompt = (
         getattr(a, "prompt", None)
         or getattr(a, "prompt_text", None)
@@ -74,11 +120,7 @@ def _get_prompt_and_knowledge(a):
     return str(prompt), str(knowledge)
 
 
-# ---------- Debug / Introspection ----------
-@app.get("/_routes")
-def routes():
-    return jsonify(sorted([f"{sorted(list(r.methods))} {r.rule}" for r in app.url_map.iter_rules()]))
-
+# ---------- Health / Assistants ----------
 @app.get("/health")
 def health():
     try:
@@ -91,29 +133,40 @@ def health():
     except Exception as e:
         return jsonify(ok=False, error=str(e), assistants_dir=str(ASSISTANTS_DIR)), 500
 
+
 @app.get("/assistants")
 def assistants():
     enabled_only = request.args.get("enabled_only", "1") != "0"
     items = STORE.list(enabled_only=enabled_only)
     return jsonify(assistants=[_assistant_to_dict(a) for a in items])
 
+
 @app.post("/reload")
 def reload_assistants():
+    # ADMIN ONLY
+    auth = require_admin_key()
+    if auth:
+        return auth
+
     global STORE
-    # If AssistantStore has reload(), use it, otherwise re-instantiate
     try:
         if hasattr(STORE, "reload"):
             STORE.reload()
         else:
             STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
+
         return jsonify(ok=True, assistants=[_assistant_to_dict(a) for a in STORE.list(enabled_only=False)])
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 
 
-# ---------- Chat ----------
+# ---------- Chat (public, rate-limited) ----------
 @app.post("/chat")
 def chat():
+    rl = rate_limited()
+    if rl:
+        return rl
+
     data = request.get_json(silent=True) or {}
 
     assistant_id = (data.get("assistant_id") or "").strip()
@@ -130,8 +183,7 @@ def chat():
 
     prompt, knowledge = _get_prompt_and_knowledge(a)
 
-    # Build messages for Mistral chat completions
-    system_text = prompt
+    system_text = prompt.strip()
     if knowledge.strip():
         system_text += "\n\nKNOWLEDGE:\n" + knowledge.strip()
 
@@ -146,7 +198,6 @@ def chat():
 
     try:
         client = MistralClient()
-        # Assumption: MistralClient has a .chat(model, messages, temperature, max_tokens) method
         reply_text = client.chat(
             model=model,
             messages=messages,
@@ -156,7 +207,6 @@ def chat():
         return jsonify(assistant_id=assistant_id, reply=reply_text)
 
     except LLMError as e:
-        # Your LLMError likely has status_code + message/detail; be tolerant.
         status = int(getattr(e, "status_code", 500) or 500)
         return jsonify(error=f"LLM error {status}: {e}"), 500
 
