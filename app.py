@@ -106,12 +106,7 @@ def force_utf8(resp):
 
 # ---------- Admin protection (for private endpoints like /reload) ----------
 def require_admin_key():
-    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
-    if not expected:
-        # If not set, don't block (useful for local dev)
-        return None
-    provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
-    if provided != expected:
+    if not _is_admin(request):
         return jsonify(error="Unauthorized"), 401
     return None
 
