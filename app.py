@@ -123,16 +123,12 @@ def _get_prompt_and_knowledge(a):
 # ---------- Health / Assistants ----------
 @app.get("/health")
 def health():
-    try:
-        assistants = STORE.list(enabled_only=False)
-        return jsonify(
-            ok=True,
-            assistants_dir=str(ASSISTANTS_DIR),
-            assistants_count=len(assistants),
-        )
-    except Exception as e:
-        return jsonify(ok=False, error=str(e), assistants_dir=str(ASSISTANTS_DIR)), 500
-
+    assistants = STORE.list(enabled_only=False)
+    return jsonify(
+        ok=True,
+        assistants_dir=str(ASSISTANTS_DIR),
+        assistants_count=len(assistants),
+    )    
 
 @app.get("/assistants")
 def assistants():
@@ -212,12 +208,6 @@ def chat():
 
     except Exception as e:
         return jsonify(error=str(e)), 500
-        match=(expected == provided and expected != ""),
-        expected_len=len(expected),
-        provided_len=len(provided),
-        expected_sha12=sha12(expected),
-        provided_sha12=sha12(provided),
-    )
 
 
 # ---------- Local dev only ----------
