@@ -261,6 +261,32 @@ def reload_assistants():
         return jsonify(ok=True, assistants=[_assistant_to_dict(a) for a in STORE.list(enabled_only=False)])
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
+@app.post("/admin/assistants/<assistant_id>/publish")
+@admin_required
+def admin_publish(assistant_id: str):
+    if not db_store:
+        return jsonify({"error": "db_not_configured"}), 500
+    pid = db_store.publish(assistant_id)
+    return jsonify({"public_id": pid})
+
+
+@app.post("/admin/assistants/<assistant_id>/unpublish")
+@admin_required
+def admin_unpublish(assistant_id: str):
+    if not db_store:
+        return jsonify({"error": "db_not_configured"}), 500
+    db_store.unpublish(assistant_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/admin/assistants/<assistant_id>/rotate_public_id")
+@admin_required
+def admin_rotate_public_id(assistant_id: str):
+    if not db_store:
+        return jsonify({"error": "db_not_configured"}), 500
+    pid = db_store.rotate_public_id(assistant_id)
+    return jsonify({"public_id": pid})
+
 
 
 # ---------- Chat (public, rate-limited) ----------
