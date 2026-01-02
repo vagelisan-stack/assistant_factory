@@ -2,6 +2,11 @@ import os
 import time
 from pathlib import Path
 from collections import defaultdict, deque
+import json
+from functools import wraps
+from flask import Flask, request, jsonify, Response
+from db_store import DBAssistantStore
+
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -20,6 +25,75 @@ STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
 # ---------- Flask ----------
 app = Flask(__name__)
 app.json.ensure_ascii = False  # allow Greek in JSON responses
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+db_store = DBAssistantStore(DATABASE_URL) if DATABASE_URL else None
+if db_store:
+    db_store.init_db()
+
+
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _read_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def bootstrap_db_from_filesystem() -> None:
+    """
+    One-time import: if DB has zero assistants, import from ./assistants/<slug>/{config.json,prompt.md,knowledge.md}
+    so we don't lose existing assistants on first DB run.
+    """
+    if not db_store:
+        return
+
+    try:
+        existing = db_store.list_admin()
+    except Exception:
+        return
+
+    if existing:
+        return
+
+    base = os.path.join(os.path.dirname(__file__), "assistants")
+    if not os.path.isdir(base):
+        return
+
+    for slug in os.listdir(base):
+        folder = os.path.join(base, slug)
+        if not os.path.isdir(folder):
+            continue
+
+        cfg_path = os.path.join(folder, "config.json")
+        prompt_path = os.path.join(folder, "prompt.md")
+        know_path = os.path.join(folder, "knowledge.md")
+
+        if not (os.path.isfile(cfg_path) and os.path.isfile(prompt_path) and os.path.isfile(know_path)):
+            continue
+
+        try:
+            config = _read_json(cfg_path)
+            prompt = _read_text(prompt_path)
+            knowledge = _read_text(know_path)
+            name = (config.get("name") or config.get("title") or slug)
+
+            db_store.create_assistant(
+                slug=slug,
+                name=name,
+                config=config,
+                prompt=prompt,
+                knowledge=knowledge,
+                created_by="bootstrap",
+            )
+        except Exception:
+            continue
+
+
+bootstrap_db_from_filesystem()
+
 
 
 @app.after_request
@@ -119,8 +193,45 @@ def _get_prompt_and_knowledge(a):
     )
     return str(prompt), str(knowledge)
 
+# ---------- Admin helpers ----------
+from functools import wraps
+
+def _is_admin(req) -> bool:
+    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+    provided = (req.headers.get("X-ADMIN-KEY") or "").strip()
+    return bool(expected) and (provided == expected)
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _is_admin(request):
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
 
 # ---------- Health / Assistants ----------
+# ---------- Public rate limiting (MVP) ----------
+_RATE = {}  # ip -> [timestamps]
+RATE_LIMIT_RPM = int(os.getenv("PUBLIC_RPM", "30"))
+
+def _client_ip():
+    return (request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote_addr
+            or "unknown")
+
+def public_rate_limit_ok() -> bool:
+    ip = _client_ip()
+    now = time.time()
+    arr = _RATE.get(ip, [])
+    arr = [t for t in arr if now - t < 60.0]
+    if len(arr) >= RATE_LIMIT_RPM:
+        _RATE[ip] = arr
+        return False
+    arr.append(now)
+    _RATE[ip] = arr
+    return True
+
 @app.get("/health")
 def health():
     assistants = STORE.list(enabled_only=False)
@@ -131,10 +242,11 @@ def health():
     )    
 
 @app.get("/assistants")
-def assistants():
-    enabled_only = request.args.get("enabled_only", "1") != "0"
-    items = STORE.list(enabled_only=enabled_only)
-    return jsonify(assistants=[_assistant_to_dict(a) for a in items])
+@admin_required
+def list_assistants():
+    if not db_store:
+        return jsonify({"error": "db_not_configured"}), 500
+    return jsonify({"assistants": db_store.list_admin()})
 
 
 @app.post("/reload")
@@ -157,6 +269,33 @@ def reload_assistants():
 
 
 # ---------- Chat (public, rate-limited) ----------
+def _reply_from_record(rec, message: str) -> str:
+    cfg = rec.config or {}
+
+    model = cfg.get("model", "mistral-large-latest")
+    temperature = float(cfg.get("temperature", 0.2))
+    max_tokens = int(cfg.get("max_tokens", 600))
+
+    parts = []
+    if (rec.prompt or "").strip():
+        parts.append(rec.prompt.strip())
+    if (rec.knowledge or "").strip():
+        parts.append("KNOWLEDGE:\n" + rec.knowledge.strip())
+    system_text = "\n\n".join(parts).strip()
+
+    messages = []
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": message})
+
+    client = MistralClient()
+    return client.chat(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
 @app.post("/chat")
 def chat():
     rl = rate_limited()
@@ -187,10 +326,7 @@ def chat():
         {"role": "system", "content": system_text.strip()},
         {"role": "user", "content": message},
     ]
-
-    model = getattr(a, "model", "mistral-large-latest")
-    temperature = float(getattr(a, "temperature", 0.2) or 0.2)
-    max_tokens = int(getattr(a, "max_tokens", 600) or 600)
+    
 
     try:
         client = MistralClient()
