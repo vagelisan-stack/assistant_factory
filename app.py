@@ -266,17 +266,28 @@ def reload_assistants():
 def admin_publish(assistant_id: str):
     if not db_store:
         return jsonify({"error": "db_not_configured"}), 500
-    pid = db_store.publish(assistant_id)
-    return jsonify({"public_id": pid})
-
+    try:
+        pid = db_store.publish(assistant_id)
+        return jsonify({"public_id": pid})
+    except ValueError as e:
+        if str(e) == "assistant_not_found":
+            return jsonify({"error": "assistant_not_found", "assistant_id": assistant_id}), 404
+        return jsonify({"error": "value_error", "detail": str(e)}), 400
+    except Exception as e:
+        app.logger.exception("publish failed")
+        return jsonify({"error": "publish_failed", "type": type(e).__name__, "detail": str(e)}), 500
 
 @app.post("/admin/assistants/<assistant_id>/unpublish")
 @admin_required
 def admin_unpublish(assistant_id: str):
     if not db_store:
         return jsonify({"error": "db_not_configured"}), 500
-    db_store.unpublish(assistant_id)
-    return jsonify({"ok": True})
+    try:
+        db_store.unpublish(assistant_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        app.logger.exception("unpublish failed")
+        return jsonify({"error": "unpublish_failed", "type": type(e).__name__, "detail": str(e)}), 500
 
 
 @app.post("/admin/assistants/<assistant_id>/rotate_public_id")
@@ -284,8 +295,12 @@ def admin_unpublish(assistant_id: str):
 def admin_rotate_public_id(assistant_id: str):
     if not db_store:
         return jsonify({"error": "db_not_configured"}), 500
-    pid = db_store.rotate_public_id(assistant_id)
-    return jsonify({"public_id": pid})
+    try:
+        pid = db_store.rotate_public_id(assistant_id)
+        return jsonify({"public_id": pid})
+    except Exception as e:
+        app.logger.exception("rotate_public_id failed")
+        return jsonify({"error": "rotate_failed", "type": type(e).__name__, "detail": str(e)}), 500
 
 
 
