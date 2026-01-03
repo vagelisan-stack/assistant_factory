@@ -1,0 +1,7 @@
+﻿{
+  "slug": "finance_clerk",
+  "name": "Finance Clerk (Personal)",
+  "enabled": true,
+  "is_public": true,
+  "requires_key": true
+}
