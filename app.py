@@ -329,61 +329,57 @@ def _reply_from_record(rec, message: str) -> str:
         max_tokens=max_tokens,
     )
 
-@app.post("/chat")
-# ---------- Public (unlisted) page + chat ----------
-@app.get("/p/<public_id>")
-def public_page(public_id: str):
-    if not db_store:
-        return ("Not Found", 404)
+def _run_assistant(rec, message: str) -> str:
+    """
+    Shared runner for both /chat and /p/<public_id>/chat.
+    Builds a simple system prompt from prompt + knowledge and calls Mistral.
+    """
+    import json
 
-    rec = db_store.get_by_public_id(public_id)
-    if not rec or not rec.enabled or not rec.is_public:
-        return ("Not Found", 404)
+    cfg = getattr(rec, "config", None)
+    if cfg is None:
+        cfg = getattr(rec, "config_json", None)
+    if cfg is None:
+        cfg = {}
 
-    title = rec.name or "Assistant"
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
 
-    html = f"""<!doctype html>
-<html lang="el">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>{title}</title>
-  <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 820px; margin: 24px auto; padding: 0 12px; }}
-    .box {{ border: 1px solid #ddd; border-radius: 12px; padding: 12px; }}
-    textarea {{ width: 100%; height: 90px; }}
-    button {{ padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }}
-    pre {{ white-space: pre-wrap; }}
-  </style>
-</head>
-<body>
-  <h2>{title}</h2>
-  <div class="box">
-    <textarea id="msg" placeholder="Γράψε μήνυμα..."></textarea>
-    <div style="margin-top:10px;">
-      <button id="send">Send</button>
-    </div>
-    <pre id="out" style="margin-top:12px;"></pre>
-  </div>
+    prompt = (getattr(rec, "prompt", None) or "").strip()
+    knowledge = (getattr(rec, "knowledge", None) or "").strip()
 
-<script>
-const out = document.getElementById('out');
-document.getElementById('send').onclick = async () => {{
-  const message = document.getElementById('msg').value.trim();
-  if (!message) return;
-  out.textContent = "…";
-  const r = await fetch(`/p/{public_id}/chat`, {{
-    method: "POST",
-    headers: {{ "Content-Type": "application/json" }},
-    body: JSON.stringify({{ message }})
-  }});
-  const data = await r.json().catch(() => ({{error:"bad_json"}}));
-  out.textContent = data.answer || data.response || JSON.stringify(data, null, 2);
-}};
-</script>
-</body>
-</html>"""
-    return Response(html, mimetype="text/html")
+    system = prompt
+    if knowledge:
+        system = (system + "\n\n" if system else "") + "### Knowledge\n" + knowledge
+
+    if not system:
+        system = "You are a helpful assistant."
+
+    model = cfg.get("model") or getattr(rec, "model", None) or "mistral-large-latest"
+    temperature = cfg.get("temperature", getattr(rec, "temperature", 0.2))
+    max_tokens = cfg.get("max_tokens", getattr(rec, "max_tokens", 600))
+
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 0.2
+
+    try:
+        max_tokens = int(max_tokens)
+    except Exception:
+        max_tokens = 600
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": message},
+    ]
+
+    client = MistralClient()
+    return client.chat(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+
 
 
 @app.post("/p/<public_id>/chat")
