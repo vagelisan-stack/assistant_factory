@@ -4,7 +4,7 @@ from pathlib import Path
 from collections import defaultdict, deque
 import json
 from functools import wraps
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, render_template_string
 from db_store import DBAssistantStore
 
 
@@ -94,6 +94,73 @@ def bootstrap_db_from_filesystem() -> None:
 
 bootstrap_db_from_filesystem()
 
+PUBLIC_CHAT_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Assistant</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 800px; margin: 24px auto; padding: 0 12px; }
+    #log { border: 1px solid #ddd; padding: 12px; height: 55vh; overflow: auto; white-space: pre-wrap; }
+    textarea { width: 100%; height: 90px; }
+    button { padding: 10px 14px; margin-top: 8px; }
+    .me { color: #111; }
+    .bot { color: #333; }
+    .muted { color: #777; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Chat</h2>
+  <div class="muted">Public ID: {{ public_id }}</div>
+  <div id="log"></div>
+
+  <textarea id="msg" placeholder="Type your message..."></textarea>
+  <br/>
+  <button id="send">Send</button>
+
+  <script>
+    const log = document.getElementById('log');
+    const msg = document.getElementById('msg');
+    const send = document.getElementById('send');
+    const endpoint = "/p/{{ public_id }}/chat";
+
+    function addLine(cls, text) {
+      const div = document.createElement('div');
+      div.className = cls;
+      div.textContent = text;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    async function doSend() {
+      const text = msg.value.trim();
+      if (!text) return;
+      addLine('me', "You: " + text);
+      msg.value = "";
+
+      try {
+        const r = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: text })
+        });
+        const data = await r.json();
+        addLine('bot', "Assistant: " + (data.answer ?? "(no answer)"));
+      } catch (e) {
+        addLine('bot', "Assistant: (error) " + e);
+      }
+    }
+
+    send.addEventListener('click', doSend);
+    msg.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSend();
+    });
+  </script>
+</body>
+</html>
+"""
 
 
 @app.after_request
@@ -328,6 +395,9 @@ def _reply_from_record(rec, message: str) -> str:
         temperature=temperature,
         max_tokens=max_tokens,
     )
+@app.get("/p/<public_id>")
+def public_page(public_id):
+    return render_template_string(PUBLIC_CHAT_HTML, public_id=public_id)
 
 def _run_assistant(rec, message: str) -> str:
     """
