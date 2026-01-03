@@ -221,6 +221,112 @@ class DBAssistantStore:
             res = con.execute(q, (slug, revision_id))
             if res.rowcount == 0:
                 raise ValueError("invalid revision_id for this assistant")
+def seed_from_filesystem(self, assistants_dir: str) -> dict:
+    """
+    Loads assistants from folders (config.json, prompt.md, knowledge.md)
+    into DB (upsert by slug). Returns {"upserted": N, "slugs":[...]}.
+    """
+    import json
+    from pathlib import Path
+
+    base = Path(assistants_dir)
+    if not base.exists():
+        return {"upserted": 0, "slugs": []}
+
+    # discover existing columns to avoid schema mismatch surprises
+    with self._conn() as con:
+        cols_rows = con.execute("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name='assistants'
+        """).fetchall()
+
+    def _colname(r):
+        # psycopg row_factory may give dict-like or tuple-like
+        try:
+            return r["column_name"]
+        except Exception:
+            return r[0]
+
+    cols = set(_colname(r) for r in cols_rows)
+
+    # columns we WANT to set, but only if they exist
+    def pick(data: dict) -> dict:
+        return {k: v for k, v in data.items() if k in cols}
+
+    upserted = 0
+    slugs = []
+
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+
+        slug = d.name
+        cfg_path = d / "config.json"
+        prompt_path = d / "prompt.md"
+        knowledge_path = d / "knowledge.md"
+
+        if not cfg_path.exists():
+            continue
+
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+
+        prompt = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
+        knowledge = knowledge_path.read_text(encoding="utf-8") if knowledge_path.exists() else ""
+
+        # sensible defaults
+        name = cfg.get("name") or slug
+        enabled = bool(cfg.get("enabled", True))
+        model = cfg.get("model", "mistral-large-latest")
+        temperature = float(cfg.get("temperature", 0.2))
+        max_tokens = int(cfg.get("max_tokens", 600))
+
+        row = pick({
+            "slug": slug,
+            "name": name,
+            "enabled": enabled,
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "config_json": json.dumps(cfg, ensure_ascii=False),
+            "prompt": prompt,
+            "knowledge": knowledge,
+            "is_public": False,
+            "public_id": None,
+        })
+
+        # build INSERT ... ON CONFLICT (slug) DO UPDATE dynamically
+        insert_cols = list(row.keys())
+        if "slug" not in insert_cols:
+            # cannot seed without slug column
+            continue
+
+        placeholders = ", ".join(["%s"] * len(insert_cols))
+        col_list = ", ".join(insert_cols)
+
+        # update everything except slug
+        update_cols = [c for c in insert_cols if c != "slug"]
+        update_set = ", ".join([f"{c}=EXCLUDED.{c}" for c in update_cols]) if update_cols else ""
+
+        q = f"""
+        INSERT INTO assistants ({col_list})
+        VALUES ({placeholders})
+        ON CONFLICT (slug)
+        DO UPDATE SET {update_set}
+        """
+
+        values = [row[c] for c in insert_cols]
+
+        with self._conn() as con:
+            con.execute(q, values)
+
+        upserted += 1
+        slugs.append(slug)
+
+    return {"upserted": upserted, "slugs": slugs}
 
     def publish(self, slug: str) -> str:
         public_id = secrets.token_urlsafe(18)

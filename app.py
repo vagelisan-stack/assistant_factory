@@ -245,20 +245,17 @@ def list_assistants():
 
 
 @app.post("/reload")
+@admin_required
 def reload_assistants():
-    # ADMIN ONLY
-    auth = require_admin_key()
-    if auth:
-        return auth
-
-    global STORE
     try:
-        if hasattr(STORE, "reload"):
-            STORE.reload()
-        else:
-            STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
+        if db_store:
+            seeded = db_store.seed_from_filesystem(str(ASSISTANTS_DIR))
+            return jsonify(ok=True, seeded=seeded, assistants=db_store.list_admin())
+        return jsonify(ok=False, error="db_not_configured"), 500
+    except Exception as e:
+        app.logger.exception("reload failed")
+        return jsonify(ok=False, error=str(e), type=type(e).__name__), 500
 
-        return jsonify(ok=True, assistants=[_assistant_to_dict(a) for a in STORE.list(enabled_only=False)])
     except Exception as e:
         return jsonify(ok=False, error=str(e)), 500
 @app.post("/admin/assistants/<assistant_id>/publish")
