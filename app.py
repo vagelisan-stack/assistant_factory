@@ -9,7 +9,107 @@ from db_store import DBAssistantStore
 
 
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
+
+import os
+def require_key_if_needed(cfg: dict):
+    cfg = cfg or {}
+    if not cfg.get("requires_key"):
+        return
+
+    expected = (os.getenv("FINANCE_KEY") or "").strip()
+    if not expected:
+        abort(500, description="FINANCE_KEY is not configured")
+
+    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
+    if provided != expected:
+        abort(401)
+
+import json
+import os
+from flask import request, abort
+
+def _assistant_config(a) -> dict:
+    cfg = None
+    if isinstance(a, dict):
+        cfg = a.get("config")
+    else:
+        cfg = getattr(a, "config", None)
+
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
+
+    return cfg if isinstance(cfg, dict) else {}
+
+def require_key_if_needed(cfg: dict):
+    cfg = cfg or {}
+    if not cfg.get("requires_key"):
+        return
+
+    expected = (os.getenv("FINANCE_KEY") or "").strip()
+    if not expected:
+        abort(500, description="FINANCE_KEY is not configured")
+
+    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
+    if provided != expected:
+        abort(401)
+
+def _get_public_assistant(public_id: str):
+    public_id = (public_id or "").strip()
+    if not public_id:
+        return None
+
+    # Prefer db_store if it exposes a getter by public_id
+    if db_store:
+        for fn_name in ("get_by_public_id", "get_public_by_public_id", "public_get", "get_public"):
+            if hasattr(db_store, fn_name):
+                try:
+                    a = getattr(db_store, fn_name)(public_id)
+                    if a:
+                        return a
+                except Exception:
+                    pass
+
+    # Fallback: scan STORE (works if STORE objects include public_id/is_public)
+    for a in STORE.list(enabled_only=False):
+        pid = (a.get("public_id") if isinstance(a, dict) else getattr(a, "public_id", None))
+        is_pub = (a.get("is_public") if isinstance(a, dict) else getattr(a, "is_public", False))
+        if pid == public_id and is_pub:
+            return a
+
+    return None
+
+
+def require_key_if_needed(cfg: dict):
+    cfg = cfg or {}
+    if not cfg.get("requires_key"):
+        return
+
+    expected = (os.getenv("FINANCE_KEY") or "").strip()
+    if not expected:
+        abort(500, description="FINANCE_KEY is not configured")
+
+    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
+    if provided != expected:
+        abort(401)
+
+
+def require_key_if_needed(cfg: dict):
+    cfg = cfg or {}
+    if not cfg.get("requires_key"):
+        return
+
+    expected = (os.getenv("FINANCE_KEY") or "").strip()
+    if not expected:
+        abort(500, description="FINANCE_KEY is not configured")
+
+    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
+    if provided != expected:
+        abort(401)
+
 
 # Load .env ONCE, early, and override any old env vars
 load_dotenv(override=True)
@@ -141,17 +241,19 @@ PUBLIC_CHAT_HTML = """
       msg.value = "";
 
       try {
-        const r = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message: text })
-        });
-        const data = await r.json();
-        addLine('bot', "Assistant: " + (data.answer ?? "(no answer)"));
-      } catch (e) {
-        addLine('bot', "Assistant: (error) " + e);
-      }
-    }
+        const params = new URLSearchParams(window.location.search);
+const k = params.get("k");
+
+const chatUrl = k
+  ? `/p/${publicId}/chat?k=${encodeURIComponent(k)}`
+  : `/p/${publicId}/chat`;
+
+fetch(chatUrl, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ message })
+})
+
 
     send.addEventListener('click', doSend);
     msg.addEventListener('keydown', (e) => {
@@ -398,7 +500,15 @@ def _reply_from_record(rec, message: str) -> str:
 from flask import make_response
 
 @app.get("/p/<public_id>")
+@app.get("/p/<public_id>")
 def public_page(public_id):
+    a = _get_public_assistant(public_id)
+    if a is None or not _assistant_enabled(a):
+        abort(404)
+
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
+
     resp = make_response(render_template_string(PUBLIC_CHAT_HTML, public_id=public_id))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -459,45 +569,22 @@ def _run_assistant(rec, message: str) -> str:
 
 
 @app.post("/p/<public_id>/chat")
-def public_chat(public_id: str):
-    if not db_store:
-        return jsonify({"error": "not_found"}), 404
-
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    if not message:
-        return jsonify({"error": "missing_message"}), 400
-
-    rec = db_store.get_by_public_id(public_id)
-    if not rec or not rec.enabled or not rec.is_public:
-        return jsonify({"error": "not_found"}), 404
-
-    try:
-        # reuse the same assistant runner you use in POST /chat
-        answer = _run_assistant(rec, message)
-        return jsonify({"answer": answer})
-    except Exception as e:
-        app.logger.exception("public chat failed")
-        return jsonify({"error": "chat_failed", "type": type(e).__name__, "detail": str(e)}), 500
-
-def chat():
+def public_chat(public_id):
     rl = rate_limited()
     if rl:
         return rl
 
     data = request.get_json(silent=True) or {}
-
-    assistant_id = (data.get("assistant_id") or "").strip()
     message = (data.get("message") or "").strip()
-
-    if not assistant_id:
-        return jsonify(error="Missing assistant_id"), 400
     if not message:
         return jsonify(error="Missing message"), 400
 
-    a = _get_assistant(assistant_id)
+    a = _get_public_assistant(public_id)
     if a is None or not _assistant_enabled(a):
-        return jsonify(error=f"Unknown/disabled assistant: {assistant_id}"), 400
+        return jsonify(error="Unknown/disabled public assistant"), 404
+
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
 
     prompt, knowledge = _get_prompt_and_knowledge(a)
 
@@ -509,7 +596,6 @@ def chat():
         {"role": "system", "content": system_text.strip()},
         {"role": "user", "content": message},
     ]
-    
 
     try:
         client = MistralClient()
@@ -519,7 +605,7 @@ def chat():
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return jsonify(assistant_id=assistant_id, reply=reply_text)
+        return jsonify(public_id=public_id, assistant_slug=_assistant_id(a), reply=reply_text)
 
     except LLMError as e:
         status = int(getattr(e, "status_code", 500) or 500)
