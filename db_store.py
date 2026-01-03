@@ -394,7 +394,10 @@ def _db_seed_from_filesystem(self, assistants_dir: str, created_by: str = "seed"
             if not cfg_path.exists():
                 continue
 
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
+            cfg_bytes = cfg_path.read_bytes()
+            cfg_text = cfg_bytes.decode("utf-8-sig").strip()  # handles UTF-8 BOM
+            cfg = json.loads(cfg_text or "{}")
+
             prompt = (d / "prompt.md").read_text(encoding="utf-8") if (d / "prompt.md").exists() else ""
             knowledge = (d / "knowledge.md").read_text(encoding="utf-8") if (d / "knowledge.md").exists() else ""
 
