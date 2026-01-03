@@ -330,6 +330,84 @@ def _reply_from_record(rec, message: str) -> str:
     )
 
 @app.post("/chat")
+# ---------- Public (unlisted) page + chat ----------
+@app.get("/p/<public_id>")
+def public_page(public_id: str):
+    if not db_store:
+        return ("Not Found", 404)
+
+    rec = db_store.get_by_public_id(public_id)
+    if not rec or not rec.enabled or not rec.is_public:
+        return ("Not Found", 404)
+
+    title = rec.name or "Assistant"
+
+    html = f"""<!doctype html>
+<html lang="el">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{title}</title>
+  <style>
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 820px; margin: 24px auto; padding: 0 12px; }}
+    .box {{ border: 1px solid #ddd; border-radius: 12px; padding: 12px; }}
+    textarea {{ width: 100%; height: 90px; }}
+    button {{ padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; }}
+    pre {{ white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <h2>{title}</h2>
+  <div class="box">
+    <textarea id="msg" placeholder="Γράψε μήνυμα..."></textarea>
+    <div style="margin-top:10px;">
+      <button id="send">Send</button>
+    </div>
+    <pre id="out" style="margin-top:12px;"></pre>
+  </div>
+
+<script>
+const out = document.getElementById('out');
+document.getElementById('send').onclick = async () => {{
+  const message = document.getElementById('msg').value.trim();
+  if (!message) return;
+  out.textContent = "…";
+  const r = await fetch(`/p/{public_id}/chat`, {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{ message }})
+  }});
+  const data = await r.json().catch(() => ({{error:"bad_json"}}));
+  out.textContent = data.answer || data.response || JSON.stringify(data, null, 2);
+}};
+</script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+@app.post("/p/<public_id>/chat")
+def public_chat(public_id: str):
+    if not db_store:
+        return jsonify({"error": "not_found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "missing_message"}), 400
+
+    rec = db_store.get_by_public_id(public_id)
+    if not rec or not rec.enabled or not rec.is_public:
+        return jsonify({"error": "not_found"}), 404
+
+    try:
+        # reuse the same assistant runner you use in POST /chat
+        answer = _run_assistant(rec, message)
+        return jsonify({"answer": answer})
+    except Exception as e:
+        app.logger.exception("public chat failed")
+        return jsonify({"error": "chat_failed", "type": type(e).__name__, "detail": str(e)}), 500
+
 def chat():
     rl = rate_limited()
     if rl:
