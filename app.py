@@ -752,41 +752,52 @@ def public_chat(public_id):
     if rl:
         return rl
 
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    if not message:
-        return jsonify(error="Missing message"), 400
+    try:
+        data = request.get_json(silent=True) or {}
 
-    a = _get_public_assistant(public_id)
-    if a is None or not _assistant_enabled(a):
-        return jsonify(error="Unknown/disabled public assistant"), 404
+        assistant_id = (data.get("assistant_id") or "").strip()
+        message = (data.get("message") or "").strip()
 
-    cfg = _assistant_config(a)
-    require_key_if_needed(cfg)
+        if not assistant_id:
+            return jsonify(error="Missing assistant_id"), 400
+        if not message:
+            return jsonify(error="Missing message"), 400
 
-    if _assistant_id(a) == "finance_clerk":
-        entry, missing = parse_finance_entry(message)
-        if missing:
-            if "amount" in missing:
-                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
-                               reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
-            if "property" in missing:
-                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
-                               reply="Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;")
-            if "type" in missing:
-                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
-                               reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
+        a = _get_public_assistant(public_id)
+        if a is None or not _assistant_enabled(a):
+            return jsonify(error="Unknown/disabled public assistant"), 404
 
-        try:
+        cfg = _assistant_config(a)
+        require_key_if_needed(cfg)
+
+        # --- Finance clerk shortcut ---
+        if _assistant_id(a) == "finance_clerk":
+            entry, missing = parse_finance_entry(message)
+            if missing:
+                if "amount" in missing:
+                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                                   reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
+                if "property" in missing:
+                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                                   reply="Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;")
+                if "type" in missing:
+                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                                   reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
+
             finance_insert(entry)
             return jsonify(
                 public_id=public_id,
                 assistant_slug="finance_clerk",
                 reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
             )
-        except Exception as e:
-            return jsonify(error=str(e)), 500
 
+        # --- Default: LLM assistant ---
+        reply_text = _run_assistant(a, message)
+        return jsonify(public_id=public_id, assistant_slug=_assistant_id(a), reply=reply_text)
+
+    except Exception as e:
+        app.logger.exception("public_chat failed")
+        return jsonify(error=str(e), type=type(e).__name__), 500
 
 @app.get("/p/<public_id>/export.csv")
 def finance_export(public_id):
