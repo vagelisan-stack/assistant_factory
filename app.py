@@ -395,9 +395,15 @@ def _reply_from_record(rec, message: str) -> str:
         temperature=temperature,
         max_tokens=max_tokens,
     )
+from flask import make_response
+
 @app.get("/p/<public_id>")
 def public_page(public_id):
-    return render_template_string(PUBLIC_CHAT_HTML, public_id=public_id)
+    resp = make_response(render_template_string(PUBLIC_CHAT_HTML, public_id=public_id))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 def _run_assistant(rec, message: str) -> str:
     """
