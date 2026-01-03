@@ -270,7 +270,10 @@ def seed_from_filesystem(self, assistants_dir: str) -> dict:
             continue
 
         try:
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg_text = cfg_path.read_text(encoding="utf-8-sig")  # handles UTF-8 BOM
+            cfg_text = cfg_text.strip()
+            cfg = json.loads(cfg_text or "{}")
+
         except Exception:
             cfg = {}
 
