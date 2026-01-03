@@ -29,6 +29,91 @@ import json
 import os
 from flask import request, abort
 
+import re
+import csv
+import uuid
+from datetime import datetime, date
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+def _finance_conn():
+    dsn = (os.getenv("DATABASE_URL") or "").strip()
+    if not dsn:
+        return None
+    return psycopg2.connect(dsn)
+
+def ensure_finance_schema():
+    con = _finance_conn()
+    if not con:
+        return
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS finance_entries (
+              id TEXT PRIMARY KEY,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              entry_date DATE NOT NULL,
+              property_slug TEXT NOT NULL,
+              entry_type TEXT NOT NULL CHECK (entry_type IN ('expense','income')),
+              amount NUMERIC(12,2) NOT NULL,
+              currency TEXT NOT NULL DEFAULT 'EUR',
+              category TEXT,
+              label TEXT,
+              note TEXT,
+              raw_text TEXT
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_date ON finance_entries(entry_date);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
+    con.close()
+
+def finance_insert(entry: dict):
+    con = _finance_conn()
+    if not con:
+        raise RuntimeError("db_not_configured")
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+              INSERT INTO finance_entries
+              (id, entry_date, property_slug, entry_type, amount, currency, category, label, note, raw_text)
+              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                entry["id"], entry["entry_date"], entry["property_slug"], entry["entry_type"],
+                entry["amount"], entry.get("currency","EUR"),
+                entry.get("category"), entry.get("label"), entry.get("note"), entry.get("raw_text")
+            ))
+    con.close()
+
+def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, date_to=None):
+    con = _finance_conn()
+    if not con:
+        raise RuntimeError("db_not_configured")
+    where = []
+    args = []
+    if property_slug:
+        where.append("property_slug=%s"); args.append(property_slug)
+    if entry_type:
+        where.append("entry_type=%s"); args.append(entry_type)
+    if date_from:
+        where.append("entry_date>=%s"); args.append(date_from)
+    if date_to:
+        where.append("entry_date<=%s"); args.append(date_to)
+
+    sql = "SELECT * FROM finance_entries"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY entry_date DESC, created_at DESC LIMIT %s"
+    args.append(int(limit))
+
+    with con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    con.close()
+    return rows
+
+
+
 def _assistant_config(a) -> dict:
     cfg = None
     if isinstance(a, dict):
@@ -72,6 +157,20 @@ def _get_public_assistant(public_id: str):
                         return a
                 except Exception:
                     pass
+try:
+    ensure_finance_schema()
+except Exception:
+    app.logger.exception("finance schema init failed")
+
+def _get_public_assistant(public_id: str):
+    # Fallback: scan STORE (works if STORE objects include public_id/is_public)
+    for a in STORE.list(enabled_only=False):
+        pid = (a.get("public_id") if isinstance(a, dict) else getattr(a, "public_id", None))
+        is_pub = (a.get("is_public") if isinstance(a, dict) else getattr(a, "is_public", False))
+        if pid == public_id and is_pub:
+            return a
+    return None
+
 
     # Fallback: scan STORE (works if STORE objects include public_id/is_public)
     for a in STORE.list(enabled_only=False):
@@ -396,6 +495,102 @@ def public_rate_limit_ok() -> bool:
     _RATE[ip] = arr
     return True
 
+_EXPENSE_WORDS = ["πλήρωσα","εδωσα","έδωσα","αγόρασα","αγορασα","ψώνισα","ψωνισα","χρεώθηκα","χρεωθηκα"]
+_INCOME_WORDS  = ["εισέπραξα","εισπραξα","πήρα","πηρα","πληρώθηκα","πληρωθηκα","έλαβα","ελαβα","μπήκαν","μπηκαν"]
+
+_PROP_MAP = {
+    "thessaloniki": ["θεσσαλονικη","θεσ","thessaloniki"],
+    "vourvourou":   ["βουρβουρου","σιθωνια","φαβα","vourvourou"],
+}
+
+_CAT_RULES = [
+    ("utilities", ["δεη","ρεύμα","ρευμα","νερό","νερο","ιντερνετ","internet","κοινόχρηστα","κοινοχρηστα"]),
+    ("home_maintenance", ["συντήρηση","συντηρηση","επισκευή","επισκευη","υδραυλ","ηλεκτρολογ","κήπος","κηπος","garden"]),
+    ("groceries", ["σουπερ","μάρκετ","μαρκετ","τροφ","supermarket"]),
+    ("rental_income", ["airbnb","booking","ενοίκ","ενοικ","βραχυχρόν","βραχυχρον"]),
+]
+
+_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+_EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρώ)?", re.IGNORECASE)
+
+def _detect_property(t: str):
+    tl = t.lower()
+    for slug, keys in _PROP_MAP.items():
+        for k in keys:
+            if k in tl:
+                return slug
+    return None
+
+def _detect_type(t: str):
+    tl = t.lower()
+    if any(w in tl for w in _INCOME_WORDS):
+        return "income"
+    if any(w in tl for w in _EXPENSE_WORDS):
+        return "expense"
+    return None
+
+def _detect_date(t: str):
+    m = _DATE_RE.search(t)
+    if not m:
+        return date.today().isoformat()
+    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if y < 100:
+        y += 2000
+    return date(y, mo, d).isoformat()
+
+def _detect_amount(t: str):
+    # παίρνουμε το τελευταίο “λογικό” ποσό, αγνοώντας ημερομηνίες
+    tmp = _DATE_RE.sub(" ", t)
+    candidates = [m.group(1) for m in _EUR_AMOUNT_RE.finditer(tmp)]
+    if not candidates:
+        return None
+    raw = candidates[-1].replace(",", ".")
+    try:
+        return round(float(raw), 2)
+    except Exception:
+        return None
+
+def _detect_category(t: str):
+    tl = t.lower()
+    for cat, keys in _CAT_RULES:
+        if any(k in tl for k in keys):
+            return cat
+    return "uncategorized"
+
+def parse_finance_entry(text: str):
+    entry_type = _detect_type(text)
+    prop = _detect_property(text)
+    amt = _detect_amount(text)
+    dt = _detect_date(text)
+
+    missing = []
+    if not entry_type:
+        missing.append("type")
+    if not prop:
+        missing.append("property")
+    if amt is None:
+        missing.append("amount")
+
+    if missing:
+        return None, missing
+
+    label = text.strip()
+    return {
+        "id": str(uuid.uuid4()),
+        "entry_date": dt,
+        "property_slug": prop,
+        "entry_type": entry_type,
+        "amount": amt,
+        "currency": "EUR",
+        "category": _detect_category(text),
+        "label": label,
+        "note": None,
+        "raw_text": text,
+    }, []
+
+
+
+
 @app.get("/health")
 def health():
     assistants = STORE.list(enabled_only=False)
@@ -586,33 +781,49 @@ def public_chat(public_id):
     cfg = _assistant_config(a)
     require_key_if_needed(cfg)
 
-    prompt, knowledge = _get_prompt_and_knowledge(a)
+    if _assistant_id(a) == "finance_clerk":
+        entry, missing = parse_finance_entry(message)
+        if missing:
+            if "amount" in missing:
+                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                               reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
+            if "property" in missing:
+                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                               reply="Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;")
+            if "type" in missing:
+                return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                               reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
 
-    system_text = prompt.strip()
-    if knowledge.strip():
-        system_text += "\n\nKNOWLEDGE:\n" + knowledge.strip()
+        try:
+            finance_insert(entry)
+            return jsonify(
+                public_id=public_id,
+                assistant_slug="finance_clerk",
+                reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
+            )
+        except Exception as e:
+            return jsonify(error=str(e)), 500
 
-    messages = [
-        {"role": "system", "content": system_text.strip()},
-        {"role": "user", "content": message},
-    ]
 
-    try:
-        client = MistralClient()
-        reply_text = client.chat(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return jsonify(public_id=public_id, assistant_slug=_assistant_id(a), reply=reply_text)
+@app.get("/p/<public_id>/export.csv")
+def finance_export(public_id):
+    a = _get_public_assistant(public_id)
+    if a is None or not _assistant_enabled(a) or _assistant_id(a) != "finance_clerk":
+        abort(404)
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
 
-    except LLMError as e:
-        status = int(getattr(e, "status_code", 500) or 500)
-        return jsonify(error=f"LLM error {status}: {e}"), 500
+    rows = finance_list(limit=500)
+    out = []
+    out.append("date,property,type,amount,currency,category,label")
+    for r in rows:
+        out.append(f"{r['entry_date']},{r['property_slug']},{r['entry_type']},{r['amount']},{r.get('currency','EUR')},{r.get('category','')},\"{(r.get('label','') or '').replace('\"','\"\"')}\"")
+    csv_text = "\n".join(out) + "\n"
+    resp = make_response(csv_text)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
+    return resp
 
-    except Exception as e:
-        return jsonify(error=str(e)), 500
 
 
 # ---------- Local dev only ----------
