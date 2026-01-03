@@ -41,3 +41,10 @@ venv/
 __pycache__/
 *.pyc
 
+# keep this folder data-only (assistant content)
+*.py
+*.bat
+requirements.txt
+fava_release/
+README_DEPLOY.md
+
