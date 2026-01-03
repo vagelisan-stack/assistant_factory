@@ -143,43 +143,23 @@ def require_key_if_needed(cfg: dict):
         abort(401)
 
 def _get_public_assistant(public_id: str):
-    public_id = (public_id or "").strip()
-    if not public_id:
-        return None
-
-    # Prefer db_store if it exposes a getter by public_id
+    # DB-first: public_id is stored in Postgres after publish
     if db_store:
-        for fn_name in ("get_by_public_id", "get_public_by_public_id", "public_get", "get_public"):
-            if hasattr(db_store, fn_name):
-                try:
-                    a = getattr(db_store, fn_name)(public_id)
-                    if a:
-                        return a
-                except Exception:
-                    pass
-try:
-    ensure_finance_schema()
-except Exception:
-    app.logger.exception("finance schema init failed")
+        try:
+            rec = db_store.get_by_public_id(public_id)
+            if rec is not None:
+                return rec
+        except Exception:
+            app.logger.exception("get_by_public_id failed")
 
-def _get_public_assistant(public_id: str):
-    # Fallback: scan STORE (works if STORE objects include public_id/is_public)
-    for a in STORE.list(enabled_only=False):
-        pid = (a.get("public_id") if isinstance(a, dict) else getattr(a, "public_id", None))
-        is_pub = (a.get("is_public") if isinstance(a, dict) else getattr(a, "is_public", False))
-        if pid == public_id and is_pub:
-            return a
-    return None
-
-
-    # Fallback: scan STORE (works if STORE objects include public_id/is_public)
+    # Fallback: scan STORE (local / legacy mode)
     for a in STORE.list(enabled_only=False):
         pid = (a.get("public_id") if isinstance(a, dict) else getattr(a, "public_id", None))
         is_pub = (a.get("is_public") if isinstance(a, dict) else getattr(a, "is_public", False))
         if pid == public_id and is_pub:
             return a
 
-    return None
+    return None   
 
 
 def require_key_if_needed(cfg: dict):
@@ -412,9 +392,24 @@ def rate_limited():
 def _assistant_id(a):
     return getattr(a, "assistant_id", getattr(a, "id", None))
 
+def _rec_get(rec, key, default=None):
+    if isinstance(rec, dict):
+        return rec.get(key, default)
+    return getattr(rec, key, default)
 
-def _assistant_enabled(a):
-    return bool(getattr(a, "enabled", False))
+
+def _assistant_enabled(a) -> bool:
+    return bool(_rec_get(a, "enabled", False))
+
+def _assistant_config(a) -> dict:
+    import json
+    cfg = _rec_get(a, "config", None) or _rec_get(a, "config_json", None) or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def _assistant_to_dict(a):
@@ -711,43 +706,32 @@ def public_page(public_id):
     return resp
 
 def _run_assistant(rec, message: str) -> str:
-    """
-    Shared runner for both /chat and /p/<public_id>/chat.
-    Builds a simple system prompt from prompt + knowledge and calls Mistral.
-    """
     import json
 
-    cfg = getattr(rec, "config", None)
-    if cfg is None:
-        cfg = getattr(rec, "config_json", None)
-    if cfg is None:
-        cfg = {}
-
+    cfg = _rec_get(rec, "config", None) or _rec_get(rec, "config_json", None) or {}
     if isinstance(cfg, str):
         try:
             cfg = json.loads(cfg)
         except Exception:
             cfg = {}
 
-    prompt = (getattr(rec, "prompt", None) or "").strip()
-    knowledge = (getattr(rec, "knowledge", None) or "").strip()
+    prompt = (_rec_get(rec, "prompt", "") or "").strip()
+    knowledge = (_rec_get(rec, "knowledge", "") or "").strip()
 
     system = prompt
     if knowledge:
         system = (system + "\n\n" if system else "") + "### Knowledge\n" + knowledge
-
     if not system:
         system = "You are a helpful assistant."
 
-    model = cfg.get("model") or getattr(rec, "model", None) or "mistral-large-latest"
-    temperature = cfg.get("temperature", getattr(rec, "temperature", 0.2))
-    max_tokens = cfg.get("max_tokens", getattr(rec, "max_tokens", 600))
+    model = (cfg.get("model") if isinstance(cfg, dict) else None) or _rec_get(rec, "model", None) or "mistral-large-latest"
+    temperature = (cfg.get("temperature") if isinstance(cfg, dict) else None) or _rec_get(rec, "temperature", 0.2)
+    max_tokens = (cfg.get("max_tokens") if isinstance(cfg, dict) else None) or _rec_get(rec, "max_tokens", 600)
 
     try:
         temperature = float(temperature)
     except Exception:
         temperature = 0.2
-
     try:
         max_tokens = int(max_tokens)
     except Exception:
@@ -760,7 +744,6 @@ def _run_assistant(rec, message: str) -> str:
 
     client = MistralClient()
     return client.chat(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
-
 
 
 @app.post("/p/<public_id>/chat")
