@@ -364,3 +364,136 @@ def seed_from_filesystem(self, assistants_dir: str) -> dict:
             if not row:
                 raise ValueError("assistant not found")
             return row["public_id"]
+# -----------------------------
+# Hotfix: bind required APIs to DBAssistantStore (seed + publish)
+# -----------------------------
+
+def _db_seed_from_filesystem(self, assistants_dir: str, created_by: str = "seed") -> dict:
+    import json
+    from pathlib import Path
+    from psycopg.types.json import Json
+
+    base = Path(assistants_dir)
+    if not base.exists():
+        return {"upserted": 0, "revisions_added": 0, "slugs": []}
+
+    upserted = 0
+    revisions_added = 0
+    slugs = []
+
+    with self._conn() as con:
+        for d in sorted(base.iterdir()):
+            if not d.is_dir():
+                continue
+
+            slug = d.name
+            cfg_path = d / "config.json"
+            if not cfg_path.exists():
+                continue
+
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8") or "{}")
+            prompt = (d / "prompt.md").read_text(encoding="utf-8") if (d / "prompt.md").exists() else ""
+            knowledge = (d / "knowledge.md").read_text(encoding="utf-8") if (d / "knowledge.md").exists() else ""
+
+            name = cfg.get("name") or slug
+            enabled = bool(cfg.get("enabled", True))
+
+            # upsert assistant row (by slug)
+            q_upsert = """
+            INSERT INTO assistants (slug, name, enabled, is_public, public_id, created_at, updated_at)
+            VALUES (%s, %s, %s, FALSE, NULL, NOW(), NOW())
+            ON CONFLICT (slug) DO UPDATE SET
+                name=EXCLUDED.name,
+                enabled=EXCLUDED.enabled,
+                updated_at=NOW()
+            RETURNING id
+            """
+            arow = con.execute(q_upsert, (slug, name, enabled)).fetchone()
+            assistant_db_id = arow["id"]
+
+            upserted += 1
+            slugs.append(slug)
+
+            # If latest revision already matches, just point current_revision_id to it
+            q_last = """
+            SELECT id, revision, config, prompt, knowledge
+            FROM assistant_revisions
+            WHERE assistant_id=%s
+            ORDER BY revision DESC
+            LIMIT 1
+            """
+            last = con.execute(q_last, (assistant_db_id,)).fetchone()
+            if last and last["config"] == cfg and (last["prompt"] or "") == prompt and (last["knowledge"] or "") == knowledge:
+                con.execute(
+                    "UPDATE assistants SET current_revision_id=%s, updated_at=NOW() WHERE id=%s",
+                    (last["id"], assistant_db_id),
+                )
+                continue
+
+            q_next = "SELECT COALESCE(MAX(revision),0)+1 AS rev FROM assistant_revisions WHERE assistant_id=%s"
+            rev = con.execute(q_next, (assistant_db_id,)).fetchone()["rev"]
+
+            q_ins = """
+            INSERT INTO assistant_revisions (assistant_id, revision, config, prompt, knowledge, created_by)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """
+            rid = con.execute(q_ins, (assistant_db_id, rev, Json(cfg), prompt, knowledge, created_by)).fetchone()["id"]
+
+            con.execute(
+                "UPDATE assistants SET current_revision_id=%s, updated_at=NOW() WHERE id=%s",
+                (rid, assistant_db_id),
+            )
+            revisions_added += 1
+
+    return {"upserted": upserted, "revisions_added": revisions_added, "slugs": slugs}
+
+
+def _db_publish(self, slug: str) -> str:
+    import secrets
+    public_id = secrets.token_urlsafe(18)
+    q = """
+    UPDATE assistants
+    SET is_public=TRUE, public_id=%s, updated_at=NOW()
+    WHERE slug=%s
+    RETURNING public_id
+    """
+    with self._conn() as con:
+        row = con.execute(q, (public_id, slug)).fetchone()
+        if not row:
+            raise ValueError("assistant_not_found")
+        return row["public_id"]
+
+
+def _db_unpublish(self, slug: str) -> None:
+    q = """
+    UPDATE assistants
+    SET is_public=FALSE, public_id=NULL, updated_at=NOW()
+    WHERE slug=%s
+    """
+    with self._conn() as con:
+        con.execute(q, (slug,))
+
+
+def _db_rotate_public_id(self, slug: str) -> str:
+    import secrets
+    public_id = secrets.token_urlsafe(18)
+    q = """
+    UPDATE assistants
+    SET public_id=%s, is_public=TRUE, updated_at=NOW()
+    WHERE slug=%s
+    RETURNING public_id
+    """
+    with self._conn() as con:
+        row = con.execute(q, (public_id, slug)).fetchone()
+        if not row:
+            raise ValueError("assistant_not_found")
+        return row["public_id"]
+
+
+# Bind (overwrite to guarantee availability)
+DBAssistantStore.seed_from_filesystem = _db_seed_from_filesystem
+DBAssistantStore.publish = _db_publish
+DBAssistantStore.unpublish = _db_unpublish
+DBAssistantStore.rotate_public_id = _db_rotate_public_id
+
