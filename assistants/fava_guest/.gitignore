@@ -1,0 +1,43 @@
+# databases
+app.db
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*_backup.db
+
+# secrets / env
+.env
+.env.*
+guest_token*.txt
+mint_*.json
+payload.json
+mint_response.json
+*token*
+*.key
+
+# local secret launchers
+run_server.local.bat
+*.local.bat
+
+# local tools / misc
+curl
+*.log
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# backups / dumps / zips
+*.bak
+*.zip
+*.b64
+*.b64.txt
+
+# local db / temp
+*.db
+__pycache__/
+*.pyc
+
