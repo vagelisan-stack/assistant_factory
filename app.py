@@ -512,7 +512,7 @@ _PROP_MAP = {
 
 _CAT_RULES = [
     ("utilities", ["δεη","ρεύμα","ρευμα","νερό","νερο","ιντερνετ","internet","κοινόχρηστα","κοινοχρηστα"]),
-    ("home_maintenance", ["συντήρηση","συντηρηση","επισκευή","επισκευη","υδραυλ","ηλεκτρολογ","κήπος","κηπος","garden"]),
+    ("home_maintenance", ["συντηρ","επισκευ","υδραυλ","ηλεκτρολογ","κηπ","garden","service","repair"]),
     ("groceries", ["σουπερ","μάρκετ","μαρκετ","τροφ","supermarket"]),
     ("rental_income", ["airbnb","booking","ενοίκ","ενοικ","βραχυχρόν","βραχυχρον"]),
 ]
@@ -558,11 +558,12 @@ def _detect_amount(t: str):
         return None
 
 def _detect_category(t: str):
-    tl = t.lower()
+    tl = _norm(t)
     for cat, keys in _CAT_RULES:
-        if any(k in tl for k in keys):
+        if any(_norm(k) in tl for k in keys):
             return cat
     return "uncategorized"
+
 import unicodedata
 
 def _norm(s: str) -> str:
