@@ -227,9 +227,8 @@ def admin_reset_finance():
 
         with psycopg2.connect(DATABASE_URL, sslmode="require") as con:
             with con.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM finance_entries WHERE assistant_id = %s",
-                    ("finance_clerk",),
+                cur.execute("DELETE FROM finance_entries")
+
                 )
                 deleted = cur.rowcount
 
