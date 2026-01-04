@@ -219,16 +219,19 @@ def admin_reset_finance():
     if not expected or provided != expected:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    con = get_db()          # χρησιμοποίησε το ίδιο που ήδη έχεις για DB
-    cur = con.cursor()
+    try:
+        con = get_db()   # αν εδώ σκάει (get_db undefined), θα το δεις καθαρά
+        cur = con.cursor()
 
-    # Προσαρμόζεις εδώ ΑΝ το πεδίο σου δεν λέγεται assistant_id:
-    cur.execute("DELETE FROM finance_entries WHERE assistant_id = %s", ("finance_clerk",))
+        cur.execute("DELETE FROM finance_entries WHERE assistant_id = %s", ("finance_clerk",))
+        deleted = cur.rowcount
+        con.commit()
 
-    deleted = cur.rowcount
-    con.commit()
+        return jsonify({"ok": True, "deleted": deleted}), 200
 
-    return jsonify({"ok": True, "deleted": deleted})
+    except Exception as e:
+        app.logger.exception("admin_reset_finance failed")
+        return jsonify({"ok": False, "error": str(e), "type": type(e).__name__}), 500
 
 
 if db_store:
