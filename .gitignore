@@ -16,3 +16,7 @@ venv/
 req.json
 
 admin_key.txt
+
+finance*.csv
+
+tral_testsassistant_factory
