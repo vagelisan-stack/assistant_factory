@@ -509,10 +509,10 @@ _DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
 _EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρώ)?", re.IGNORECASE)
 
 def _detect_property(t: str):
-    tl = t.lower()
+    tl = _norm(t)
     for slug, keys in _PROP_MAP.items():
         for k in keys:
-            if k in tl:
+            if _norm(k) in tl:
                 return slug
     return None
 
@@ -551,6 +551,14 @@ def _detect_category(t: str):
         if any(k in tl for k in keys):
             return cat
     return "uncategorized"
+import unicodedata
+
+def _norm(s: str) -> str:
+    s = (s or "").casefold()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # strip accents
+    return s
+
 
 def parse_finance_entry(text: str):
     entry_type = _detect_type(text)
