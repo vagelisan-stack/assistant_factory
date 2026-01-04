@@ -393,7 +393,16 @@ def rate_limited():
 
 # ---------- Helpers ----------
 def _assistant_id(a):
-    return getattr(a, "assistant_id", getattr(a, "id", None))
+    if a is None:
+        return None
+    if isinstance(a, dict):
+        return a.get("slug") or a.get("assistant_id") or a.get("id")
+    return (
+        getattr(a, "slug", None)
+        or getattr(a, "assistant_id", None)
+        or getattr(a, "id", None)
+    )
+
 
 def _rec_get(rec, key, default=None):
     if isinstance(rec, dict):
