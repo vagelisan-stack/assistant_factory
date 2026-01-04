@@ -228,9 +228,8 @@ def admin_reset_finance():
         with psycopg2.connect(DATABASE_URL, sslmode="require") as con:
             with con.cursor() as cur:
                 cur.execute("DELETE FROM finance_entries")
-
-                )
                 deleted = cur.rowcount
+            con.commit()
 
         return jsonify({"ok": True, "deleted": deleted}), 200
 
