@@ -11,7 +11,7 @@ from db_store import DBAssistantStore
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, abort
 
-APP_BUILD = "06740f8"
+APP_BUILD = "b1bc6c4"
 
 
 import os
@@ -824,24 +824,48 @@ def public_chat(public_id):
         app.logger.exception("public_chat failed")
         return jsonify(error=str(e), type=type(e).__name__), 500
 
+from werkzeug.exceptions import HTTPException  # βάλε το κοντά στα imports
+
 @app.get("/p/<public_id>/export.csv")
 def finance_export(public_id):
-    a = _get_public_assistant(public_id)
-    if a is None or not _assistant_enabled(a) or _assistant_id(a) != "finance_clerk":
-        abort(404)
-    cfg = _assistant_config(a)
-    require_key_if_needed(cfg)
+    try:
+        a = _get_public_assistant(public_id)
+        if a is None:
+            return jsonify(error="assistant_not_found"), 404
+        if not _assistant_enabled(a):
+            return jsonify(error="assistant_disabled"), 404
 
-    rows = finance_list(limit=500)
-    out = []
-    out.append("date,property,type,amount,currency,category,label")
-    for r in rows:
-        out.append(f"{r['entry_date']},{r['property_slug']},{r['entry_type']},{r['amount']},{r.get('currency','EUR')},{r.get('category','')},\"{(r.get('label','') or '').replace('\"','\"\"')}\"")
-    csv_text = "\n".join(out) + "\n"
-    resp = make_response(csv_text)
-    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-    resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
-    return resp
+        cfg = _assistant_config(a)
+
+        try:
+            require_key_if_needed(cfg)
+        except HTTPException as e:
+            return jsonify(error="unauthorized", code=e.code), (e.code or 401)
+
+        slug = _assistant_id(a)
+        if slug != "finance_clerk":
+            return jsonify(error="not_finance_clerk", slug=slug), 404
+
+        rows = finance_list(limit=5000)
+
+        out = []
+        out.append("date,property,type,amount,currency,category,label")
+        for r in rows:
+            out.append(
+                f"{r['entry_date']},{r['property_slug']},{r['entry_type']},{r['amount']},"
+                f"{r.get('currency','EUR')},{r.get('category','')},"
+                f"\"{(r.get('label','') or '').replace('\"','\"\"')}\""
+            )
+
+        csv_text = "\n".join(out) + "\n"
+        resp = make_response(csv_text)
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
+        return resp
+
+    except Exception as e:
+        app.logger.exception("finance_export failed")
+        return jsonify(error="export_failed", detail=str(e)), 500
 
 
 
