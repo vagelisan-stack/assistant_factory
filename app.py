@@ -220,12 +220,18 @@ def admin_reset_finance():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     try:
-        con = get_db()   # αν εδώ σκάει (get_db undefined), θα το δεις καθαρά
-        cur = con.cursor()
+        import psycopg2
 
-        cur.execute("DELETE FROM finance_entries WHERE assistant_id = %s", ("finance_clerk",))
-        deleted = cur.rowcount
-        con.commit()
+        if not DATABASE_URL:
+            return jsonify({"ok": False, "error": "DATABASE_URL not set"}), 500
+
+        with psycopg2.connect(DATABASE_URL, sslmode="require") as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM finance_entries WHERE assistant_id = %s",
+                    ("finance_clerk",),
+                )
+                deleted = cur.rowcount
 
         return jsonify({"ok": True, "deleted": deleted}), 200
 
