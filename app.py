@@ -306,70 +306,274 @@ bootstrap_db_from_filesystem()
 
 PUBLIC_CHAT_HTML = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Assistant</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Finance Clerk</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 800px; margin: 24px auto; padding: 0 12px; }
-    #log { border: 1px solid #ddd; padding: 12px; height: 55vh; overflow: auto; white-space: pre-wrap; }
-    textarea { width: 100%; height: 90px; }
-    button { padding: 10px 14px; margin-top: 8px; }
-    .me { color: #111; }
-    .bot { color: #333; }
-    .muted { color: #777; font-size: 12px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; background: #fff; color: #111; }
+    .wrap { max-width: 900px; margin: 0 auto; }
+    .muted { color:#666; font-size: 0.95rem; }
+    .card { border:1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin: 12px 0; }
+    .row { display:flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    input[type="password"], input[type="text"], textarea {
+      border:1px solid #ccc; border-radius: 10px; padding: 10px; font-size: 1rem;
+    }
+    textarea { width: 100%; min-height: 90px; resize: vertical; }
+    button {
+      border:1px solid #ccc; background:#f7f7f7; border-radius: 10px;
+      padding: 10px 14px; cursor:pointer; font-size: 1rem;
+    }
+    button:hover { background:#efefef; }
+    button.primary { background:#111; color:#fff; border-color:#111; }
+    button.primary:hover { background:#000; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background:#f1f1f1; font-size: 0.9rem; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95rem; }
+    .err { color:#b00020; }
+    .ok { color:#0a7b34; }
   </style>
 </head>
 <body>
-  <h2>Chat</h2>
-  <div class="muted">Finance Clerk</div>
-  <div id="log"></div>
+  <div class="wrap">
+    <h2>Finance Clerk</h2>
+    <div class="muted">Key is stored locally in your browser (one-time per device).</div>
 
-  <textarea id="msg" placeholder="Type your message..."></textarea>
-  <br/>
-  <button id="send">Send</button>
+    <div class="card" id="keyBox">
+      <div class="row">
+        <input id="apiKey" type="password" placeholder="Paste finance key once" autocomplete="off" style="min-width: 280px;">
+        <button id="toggleKey">Show</button>
+        <button id="saveKey" class="primary">Save</button>
+        <button id="forgetKey">Forget</button>
+        <span id="keyStatus" class="pill"></span>
+      </div>
+      <div class="muted" style="margin-top:8px;">
+        Tip: If you previously used ?k=... in the URL, this page will auto-save it once and remove it from the address bar.
+      </div>
+    </div>
 
-  <script>
-    const log = document.getElementById('log');
-    const msg = document.getElementById('msg');
-    const send = document.getElementById('send');
-    const endpoint = "/p/{{ public_id }}/chat";
+    <div class="card">
+      <div class="row" style="justify-content: space-between;">
+        <div>
+          <strong>Chat</strong>
+          <div class="muted">Example: “Πλήρωσα κήπο Βουρβουρού 60€ 2/1/2026”</div>
+        </div>
+        <div class="row">
+          <button id="downloadCsv">Download CSV</button>
+        </div>
+      </div>
 
-    function addLine(cls, text) {
-      const div = document.createElement('div');
-      div.className = cls;
-      div.textContent = text;
-      log.appendChild(div);
-      log.scrollTop = log.scrollHeight;
+      <div id="log" style="margin-top:12px; padding:12px; background:#fafafa; border-radius: 12px; border:1px solid #eee; min-height: 120px;"></div>
+
+      <div style="margin-top:12px;">
+        <textarea id="msg" placeholder="Type a message..."></textarea>
+      </div>
+
+      <div class="row" style="margin-top:10px;">
+        <button id="send" class="primary">Send</button>
+        <span id="status" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+<script>
+(function () {
+  const publicId = "{{ public_id }}";
+  const STORAGE_KEY = `finance_key:${publicId}`;
+
+  const elKey = document.getElementById("apiKey");
+  const elToggle = document.getElementById("toggleKey");
+  const elSave = document.getElementById("saveKey");
+  const elForget = document.getElementById("forgetKey");
+  const elKeyStatus = document.getElementById("keyStatus");
+
+  const elLog = document.getElementById("log");
+  const elMsg = document.getElementById("msg");
+  const elSend = document.getElementById("send");
+  const elStatus = document.getElementById("status");
+  const elDownload = document.getElementById("downloadCsv");
+
+  function getSavedKey() {
+    return (localStorage.getItem(STORAGE_KEY) || "").trim();
+  }
+  function setSavedKey(k) {
+    localStorage.setItem(STORAGE_KEY, (k || "").trim());
+  }
+  function clearSavedKey() {
+    localStorage.removeItem(STORAGE_KEY);
+  }
+
+  function setStatus(text, isError=false) {
+    elStatus.textContent = text || "";
+    elStatus.className = isError ? "muted err" : "muted";
+  }
+
+  function appendLog(text, cls) {
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = text;
+    elLog.appendChild(line);
+    elLog.scrollTop = elLog.scrollHeight;
+  }
+
+  function updateKeyUI() {
+    const has = !!getSavedKey();
+    elKeyStatus.textContent = has ? "Key saved" : "No key saved";
+    elKeyStatus.className = has ? "pill ok" : "pill err";
+  }
+
+  // Migration helper: if URL has ?k=..., save it once then remove from URL
+  try {
+    const url = new URL(window.location.href);
+    const k = (url.searchParams.get("k") || "").trim();
+    if (k && !getSavedKey()) {
+      setSavedKey(k);
+    }
+    if (url.searchParams.has("k")) {
+      url.searchParams.delete("k");
+      window.history.replaceState({}, "", url.toString());
+    }
+  } catch (e) {}
+
+  elToggle.addEventListener("click", () => {
+    if (elKey.type === "password") {
+      elKey.type = "text";
+      elToggle.textContent = "Hide";
+    } else {
+      elKey.type = "password";
+      elToggle.textContent = "Show";
+    }
+  });
+
+  elSave.addEventListener("click", () => {
+    const k = (elKey.value || "").trim();
+    if (!k) { alert("Paste the finance key first."); return; }
+    setSavedKey(k);
+    elKey.value = "";
+    elKey.type = "password";
+    elToggle.textContent = "Show";
+    updateKeyUI();
+    setStatus("Key saved.");
+  });
+
+  elForget.addEventListener("click", () => {
+    clearSavedKey();
+    updateKeyUI();
+    setStatus("Key removed.");
+  });
+
+  async function postChat(message) {
+    const key = getSavedKey();
+    if (!key) {
+      alert("No finance key saved. Paste it once and hit Save.");
+      return;
     }
 
-    async function doSend() {
-      const text = msg.value.trim();
-      if (!text) return;
-      addLine('me', "You: " + text);
-      msg.value = "";
+    setStatus("Sending...");
+    elSend.disabled = true;
 
-      try {
-        const params = new URLSearchParams(window.location.search);
-const k = params.get("k");
+    try {
+      const resp = await fetch(`/p/${publicId}/chat`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-FINANCE-KEY": key
+        },
+        body: JSON.stringify({ assistant_id: "finance_clerk", message })
+      });
 
-const chatUrl = k
-  ? `/p/${publicId}/chat?k=${encodeURIComponent(k)}`
-  : `/p/${publicId}/chat`;
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
 
-fetch(chatUrl, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ message })
-})
+      if (!resp.ok) {
+        const errMsg = data && (data.error || data.message) ? (data.error || data.message) : text;
+        setStatus("Error sending message.", true);
+        appendLog("ERROR: " + errMsg, "err");
+        return;
+      }
 
+      // Try to print something useful
+      if (data && data.answer) {
+        appendLog("YOU: " + message);
+        appendLog("BOT: " + data.answer);
+      } else {
+        appendLog("YOU: " + message);
+        appendLog("OK");
+      }
 
-    send.addEventListener('click', doSend);
-    msg.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) doSend();
-    });
-  </script>
+      setStatus("Sent.");
+    } catch (e) {
+      setStatus("Network error.", true);
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+    } finally {
+      elSend.disabled = false;
+    }
+  }
+
+  async function downloadCsv() {
+    const key = getSavedKey();
+    if (!key) {
+      alert("No finance key saved. Paste it once and hit Save.");
+      return;
+    }
+
+    setStatus("Considered downloading CSV...");
+    try {
+      const resp = await fetch(`/p/${publicId}/export.csv`, {
+        method: "GET",
+        headers: { "X-FINANCE-KEY": key }
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        setStatus("CSV download failed.", true);
+        appendLog("ERROR: " + t, "err");
+        return;
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      const now = new Date();
+      const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.href = url;
+      a.download = `finance_${publicId}_${stamp}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      setStatus("CSV downloaded.");
+    } catch (e) {
+      setStatus("Network error.", true);
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+    }
+  }
+
+  elSend.addEventListener("click", () => {
+    const m = (elMsg.value || "").trim();
+    if (!m) return;
+    elMsg.value = "";
+    postChat(m);
+  });
+
+  // Enter to send, Shift+Enter for newline
+  elMsg.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      elSend.click();
+    }
+  });
+
+  elDownload.addEventListener("click", downloadCsv);
+
+  // Initial UI state
+  updateKeyUI();
+  appendLog("Ready. Save key once, then start logging expenses.", "muted");
+})();
+</script>
 </body>
 </html>
 """
