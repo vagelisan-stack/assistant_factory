@@ -945,7 +945,7 @@ def _reply_from_record(rec, message: str) -> str:
     )
 from flask import make_response
 
-@app.get("/p/<public_id>")
+
 @app.get("/p/<public_id>")
 def public_page(public_id):
     a = _get_public_assistant(public_id)
