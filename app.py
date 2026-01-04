@@ -952,8 +952,7 @@ def public_page(public_id):
     if a is None or not _assistant_enabled(a):
         abort(404)
 
-    cfg = _assistant_config(a)
-    require_key_if_needed(cfg)
+    cfg = _assistant_config(a)    
 
     resp = make_response(render_template_string(PUBLIC_CHAT_HTML, public_id=public_id))
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
