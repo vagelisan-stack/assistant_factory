@@ -11,6 +11,9 @@ from db_store import DBAssistantStore
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, abort
 
+APP_BUILD = "06740f8"
+
+
 import os
 def require_key_if_needed(cfg: dict):
     cfg = cfg or {}
@@ -599,9 +602,12 @@ def health():
     assistants = STORE.list(enabled_only=False)
     return jsonify(
         ok=True,
+        build=APP_BUILD,
         assistants_dir=str(ASSISTANTS_DIR),
         assistants_count=len(assistants),
-    )    
+    )
+        
+        
 
 @app.get("/assistants")
 @admin_required
