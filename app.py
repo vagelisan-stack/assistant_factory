@@ -210,6 +210,27 @@ app.json.ensure_ascii = False  # allow Greek in JSON responses
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 
 db_store = DBAssistantStore(DATABASE_URL) if DATABASE_URL else None
+
+@app.post("/admin/reset_finance")
+def admin_reset_finance():
+    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+    provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
+
+    if not expected or provided != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    con = get_db()          # χρησιμοποίησε το ίδιο που ήδη έχεις για DB
+    cur = con.cursor()
+
+    # Προσαρμόζεις εδώ ΑΝ το πεδίο σου δεν λέγεται assistant_id:
+    cur.execute("DELETE FROM finance_entries WHERE assistant_id = %s", ("finance_clerk",))
+
+    deleted = cur.rowcount
+    con.commit()
+
+    return jsonify({"ok": True, "deleted": deleted})
+
+
 if db_store:
     db_store.init_db()
 
@@ -295,7 +316,7 @@ PUBLIC_CHAT_HTML = """
 </head>
 <body>
   <h2>Chat</h2>
-  <div class="muted">Public ID: {{ public_id }}</div>
+  <div class="muted">Finance Clerk</div>
   <div id="log"></div>
 
   <textarea id="msg" placeholder="Type your message..."></textarea>
