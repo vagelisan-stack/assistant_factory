@@ -769,31 +769,42 @@ def public_chat(public_id):
 
         cfg = _assistant_config(a)
         require_key_if_needed(cfg)
+        slug = getattr(a, "slug", None) or (a.get("slug") if isinstance(a, dict) else None) or ""
+        slug = str(slug)
 
+        if assistant_id != slug:
+            return jsonify(
+                error="assistant_id does not match public_id",
+                expected=slug,
+                provided=assistant_id
+            ), 400
         # --- Finance clerk shortcut ---
-        if _assistant_id(a) == "finance_clerk":
+        if slug == "finance_clerk":
             entry, missing = parse_finance_entry(message)
             if missing:
                 if "amount" in missing:
-                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                    return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
                 if "property" in missing:
-                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                    return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;")
                 if "type" in missing:
-                    return jsonify(public_id=public_id, assistant_slug="finance_clerk",
+                    return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
 
             finance_insert(entry)
             return jsonify(
                 public_id=public_id,
-                assistant_slug="finance_clerk",
+                assistant_slug=slug,
                 reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
             )
+                   
+
 
         # --- Default: LLM assistant ---
         reply_text = _run_assistant(a, message)
-        return jsonify(public_id=public_id, assistant_slug=_assistant_id(a), reply=reply_text)
+        return jsonify(public_id=public_id, assistant_slug=slug, reply=reply_text)
+
 
     except Exception as e:
         app.logger.exception("public_chat failed")
