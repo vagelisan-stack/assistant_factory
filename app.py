@@ -79,6 +79,21 @@ def ensure_finance_schema():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_date ON finance_entries(entry_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
+
+            # ✅ ΕΔΩ ΜΠΑΙΝΕΙ (μέσα στο cursor)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS finance_wizard_state (
+              public_id TEXT NOT NULL,
+              client_id TEXT NOT NULL,
+              assistant_slug TEXT NOT NULL,
+              base_text TEXT NOT NULL,
+              combined_text TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (public_id, client_id, assistant_slug)
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_finwiz_updated ON finance_wizard_state(updated_at);")
+
     con.close()
 
 def ensure_finance_pending_schema():
