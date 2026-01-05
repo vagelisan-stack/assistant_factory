@@ -39,7 +39,6 @@ db_store = DBAssistantStore(DATABASE_URL) if DATABASE_URL else None
 if db_store:
     db_store.init_db()
 
-
 # ---------------------------
 # Finance DB helpers (Postgres)
 # ---------------------------
@@ -79,8 +78,9 @@ def ensure_finance_schema():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_date ON finance_entries(entry_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_created ON finance_entries(created_at);")
 
-            # NEW: merchant memory
+            # merchant memory
             cur.execute("""
             CREATE TABLE IF NOT EXISTS finance_merchant_map (
               token TEXT PRIMARY KEY,
@@ -89,6 +89,12 @@ def ensure_finance_schema():
             );
             """)
     con.close()
+
+
+# Ensure finance schema once at startup (if DB configured)
+if DATABASE_URL:
+    ensure_finance_schema()
+
 
 def ensure_finance_pending_schema():
     con = _finance_conn()
@@ -107,6 +113,7 @@ def ensure_finance_pending_schema():
             """)
     con.close()
 
+
 def finance_pending_get(public_id: str, client_id: str):
     ensure_finance_pending_schema()
     con = _finance_conn()
@@ -124,6 +131,7 @@ def finance_pending_get(public_id: str, client_id: str):
     except Exception:
         return None
 
+
 def finance_pending_upsert(public_id: str, client_id: str, data: dict):
     ensure_finance_pending_schema()
     con = _finance_conn()
@@ -140,6 +148,7 @@ def finance_pending_upsert(public_id: str, client_id: str, data: dict):
             """, (public_id, client_id, payload))
     con.close()
 
+
 def finance_pending_clear(public_id: str, client_id: str):
     ensure_finance_pending_schema()
     con = _finance_conn()
@@ -149,7 +158,6 @@ def finance_pending_clear(public_id: str, client_id: str):
         with con.cursor() as cur:
             cur.execute("DELETE FROM finance_pending WHERE public_id=%s AND client_id=%s", (public_id, client_id))
     con.close()
-
 
 
 def finance_insert(entry: dict):
@@ -199,11 +207,6 @@ def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, 
             rows = cur.fetchall()
     con.close()
     return rows
-
-
-# Make sure finance table exists (when DB exists)
-if DATABASE_URL:
-    ensure_finance_schema()
 
 
 # ---------------------------
@@ -322,13 +325,22 @@ def rate_limited():
 # ---------------------------
 # Finance parsing (Greek-friendly)
 # ---------------------------
-_EXPENSE_WORDS = ["πλήρωσα", "εδωσα", "έδωσα", "αγόρασα", "αγορασα", "ψώνισα", "ψωνισα", "χρεώθηκα", "χρεωθηκα","πλήρωσα", "πληρωσα",
+_EXPENSE_WORDS = [
+    "πλήρωσα", "πληρωσα",
     "εδωσα", "έδωσα",
     "αγόρασα", "αγορασα",
     "ψώνισα", "ψωνισα",
     "χρεώθηκα", "χρεωθηκα",
+    "έξοδο", "εξοδο", "expense",
 ]
-_INCOME_WORDS  = ["εισέπραξα", "εισπραξα", "πήρα", "πηρα", "πληρώθηκα", "πληρωθηκα", "έλαβα", "ελαβα", "μπήκαν", "μπηκαν"]
+_INCOME_WORDS  = [
+    "εισέπραξα", "εισπραξα",
+    "πήρα", "πηρα",
+    "πληρώθηκα", "πληρωθηκα",
+    "έλαβα", "ελαβα",
+    "μπήκαν", "μπηκαν",
+    "έσοδο", "εσοδο", "income",
+]
 
 _PROP_MAP = {
     "thessaloniki": ["θεσσαλονικη", "θεσ", "thessaloniki"],
@@ -367,6 +379,7 @@ def _detect_property(t: str):
                 return slug
     return None
 
+
 def _detect_type(t: str):
     tl = _norm(t)
     if any(_norm(w) in tl for w in _INCOME_WORDS):
@@ -374,6 +387,7 @@ def _detect_type(t: str):
     if any(_norm(w) in tl for w in _EXPENSE_WORDS):
         return "expense"
     return None
+
 
 _LABEL_NOISE = {
     "θεσσαλονικη","thessaloniki",
@@ -398,36 +412,6 @@ def _label_candidate(text: str):
     if len(t.split()) == 1 and tl in _PROP_MAP.get("thessaloniki", []) + _PROP_MAP.get("vourvourou", []):
         return None
     return t
-
-def parse_finance_fields(text: str) -> dict:
-    return {
-        "entry_type": _detect_type(text),
-        "property_slug": _detect_property(text),
-        "amount": _detect_amount(text),
-        "entry_date": _detect_date(text),
-        "category": _detect_category(text),
-        "label": _label_candidate(text),
-        "raw_text": (text or "").strip(),
-    }
-
-def missing_fields(state: dict):
-    missing = []
-    if not state.get("entry_type"):
-        missing.append("type")
-    if not state.get("property_slug"):
-        missing.append("property")
-    if state.get("amount") is None:
-        missing.append("amount")
-    return missing
-
-def looks_like_new_entry(fields: dict) -> bool:
-    # “Νέο entry” μόνο όταν δίνει αρκετά σήματα μαζί
-    has_amount = fields.get("amount") is not None
-    has_prop = bool(fields.get("property_slug"))
-    has_type = bool(fields.get("entry_type"))
-    # safe rule: νέο entry αν έχει amount + (prop ή type) ή αν έχει και τα 3
-    return has_amount and (has_prop or has_type)
-
 
 
 def _detect_date(t: str):
@@ -461,36 +445,106 @@ def _detect_category(t: str):
     return "uncategorized"
 
 
-def parse_finance_entry(text: str):
-    entry_type = _detect_type(text)
-    prop = _detect_property(text)
-    amt = _detect_amount(text)
-    dt = _detect_date(text)
-
-    missing = []
-    if not entry_type:
-        missing.append("type")
-    if not prop:
-        missing.append("property")
-    if amt is None:
-        missing.append("amount")
-
-    if missing:
-        return None, missing
-
-    label = text.strip()
+def parse_finance_fields(text: str) -> dict:
     return {
-        "id": str(uuid.uuid4()),
-        "entry_date": dt,
-        "property_slug": prop,
-        "entry_type": entry_type,
-        "amount": amt,
-        "currency": "EUR",
+        "entry_type": _detect_type(text),
+        "property_slug": _detect_property(text),
+        "amount": _detect_amount(text),
+        "entry_date": _detect_date(text),
         "category": _detect_category(text),
-        "label": label,
-        "note": None,
-        "raw_text": text,
-    }, []
+        "label": _label_candidate(text),
+        "raw_text": (text or "").strip(),
+    }
+
+
+def missing_fields(state: dict):
+    missing = []
+    if not state.get("entry_type"):
+        missing.append("type")
+    if not state.get("property_slug"):
+        missing.append("property")
+    if state.get("amount") is None:
+        missing.append("amount")
+    return missing
+
+
+def looks_like_new_entry(fields: dict) -> bool:
+    has_amount = fields.get("amount") is not None
+    has_prop = bool(fields.get("property_slug"))
+    has_type = bool(fields.get("entry_type"))
+    return has_amount and (has_prop or has_type)
+
+
+def merchant_map_set(token: str, category: str):
+    con = _finance_conn()
+    if not con:
+        raise RuntimeError("db_not_configured")
+    token = (token or "").strip()
+    category = (category or "").strip()
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+              INSERT INTO finance_merchant_map(token, category, updated_at)
+              VALUES (%s, %s, NOW())
+              ON CONFLICT(token)
+              DO UPDATE SET category=EXCLUDED.category, updated_at=NOW()
+            """, (token, category))
+    con.close()
+
+
+def merchant_map_guess_category(text: str):
+    """Very simple: if any stored token appears in text, return its category."""
+    con = _finance_conn()
+    if not con:
+        return None
+    tl = _norm(text)
+    with con:
+        with con.cursor() as cur:
+            cur.execute("SELECT token, category FROM finance_merchant_map")
+            rows = cur.fetchall()
+    con.close()
+
+    for token, cat in rows:
+        if _norm(token) in tl:
+            return cat
+    return None
+
+
+def _is_greeting(msg: str) -> bool:
+    t = _norm(msg)
+    return t in ("γεια", "γεια σου", "καλημερα", "καλημέρα", "καλησπερα", "καληνυχτα", "hello", "hi")
+
+
+def _get_client_id_for_state(public_id: str) -> str:
+    # UI already sends X-CLIENT-ID. If missing, fallback to IP.
+    return (request.headers.get("X-CLIENT-ID") or "").strip() or get_client_ip()
+
+
+def _finance_auth_and_get_clerk(public_id: str):
+    a = _get_public_assistant(public_id)
+    if a is None:
+        return None, (jsonify(error="assistant_not_found"), 404)
+    if not _assistant_enabled(a):
+        return None, (jsonify(error="assistant_disabled"), 404)
+
+    cfg = _assistant_config(a)
+    try:
+        require_key_if_needed(cfg)
+    except HTTPException as e:
+        return None, (jsonify(error="unauthorized", code=e.code), (e.code or 401))
+
+    slug = str(_assistant_id(a) or "")
+    if slug != "finance_clerk":
+        return None, (jsonify(error="not_finance_clerk", slug=slug), 404)
+
+    return a, None
+
+
+@app.after_request
+def force_utf8(resp):
+    if resp.mimetype == "application/json":
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp
 
 
 # ---------------------------
@@ -611,10 +665,12 @@ PUBLIC_CHAT_HTML = r"""
     <div class="card">
       <div class="row" style="justify-content: space-between;">
         <div>
-          <strong>Chat</strong>
+          <strong>Finance</strong>
           <div class="muted">Example: “Πλήρωσα κήπο Βουρβουρού 60€ 2/1/2026”</div>
         </div>
         <div class="row">
+          <button id="undoLast" type="button">Undo last</button>
+          <button id="deleteById" type="button">Delete by ID</button>
           <button id="downloadCsv" type="button">Download CSV</button>
         </div>
       </div>
@@ -652,6 +708,8 @@ PUBLIC_CHAT_HTML = r"""
   const elSend = document.getElementById("send");
   const elStatus = document.getElementById("status");
   const elDownload = document.getElementById("downloadCsv");
+  const elUndo = document.getElementById("undoLast");
+  const elDelete = document.getElementById("deleteById");
 
   function setStatus(text, isError=false) {
     elStatus.textContent = text || "";
@@ -779,21 +837,21 @@ PUBLIC_CHAT_HTML = r"""
       let data = null;
       try { data = JSON.parse(text); } catch (e) {}
 
-      appendLog("YOU: " + message, "user");
+      appendLog(message, "user");
 
       if (!resp.ok) {
         const errMsg = data && (data.error || data.message) ? (data.error || data.message) : text;
         setStatus("Error.", true);
-        appendLog("BOT: ERROR: " + errMsg, "err");
+        appendLog("ERROR: " + errMsg, "err");
         return;
       }
 
       const botText = data && (data.reply || data.answer || data.message || data.error);
-      appendLog("BOT: " + (botText || "(empty)"), "bot");
+      appendLog(botText || "(empty)", "bot");
       setStatus("Sent.");
     } catch (e) {
       setStatus("Network error.", true);
-      appendLog("BOT: ERROR: " + (e && e.message ? e.message : String(e)), "err");
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
     } finally {
       elSend.disabled = false;
     }
@@ -821,7 +879,7 @@ PUBLIC_CHAT_HTML = r"""
       if (!resp.ok) {
         const t = await resp.text();
         setStatus("CSV download failed.", true);
-        appendLog("BOT: ERROR: " + t, "err");
+        appendLog("ERROR: " + t, "err");
         return;
       }
 
@@ -841,7 +899,82 @@ PUBLIC_CHAT_HTML = r"""
       setStatus("CSV downloaded.");
     } catch (e) {
       setStatus("Network error.", true);
-      appendLog("BOT: ERROR: " + (e && e.message ? e.message : String(e)), "err");
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+    }
+  }
+
+  async function undoLast() {
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
+    if (requiresKey && !key) { alert("No finance key saved."); return; }
+
+    const prop = (prompt("Property slug? (vourvourou / thessaloniki). Leave empty for global undo.") || "").trim();
+    if (!confirm("Undo last entry" + (prop ? (" for " + prop) : "") + "?")) return;
+
+    setStatus("Undoing...");
+    try {
+      const resp = await fetch(`/p/${publicId}/finance/undo_last`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+          "X-CLIENT-ID": clientId
+        },
+        body: JSON.stringify({ confirm: true, property_slug: prop || null })
+      });
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
+
+      if (!resp.ok) {
+        setStatus("Undo failed.", true);
+        appendLog("ERROR: " + (data && (data.error || data.detail) ? (data.error || data.detail) : text), "err");
+        return;
+      }
+
+      appendLog("Undone: " + (data.undone_id || data.message || "ok"), "bot");
+      setStatus("Undone.");
+    } catch (e) {
+      setStatus("Network error.", true);
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+    }
+  }
+
+  async function deleteById() {
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
+    if (requiresKey && !key) { alert("No finance key saved."); return; }
+
+    const id = (prompt("Paste entry id to delete:") || "").trim();
+    if (!id) return;
+    if (!confirm("Delete entry id:\n" + id + "\n\nThis cannot be undone.")) return;
+
+    setStatus("Deleting...");
+    try {
+      const resp = await fetch(`/p/${publicId}/finance/delete`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+          "X-CLIENT-ID": clientId
+        },
+        body: JSON.stringify({ confirm: true, id })
+      });
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) {}
+
+      if (!resp.ok) {
+        setStatus("Delete failed.", true);
+        appendLog("ERROR: " + (data && (data.error || data.detail) ? (data.error || data.detail) : text), "err");
+        return;
+      }
+
+      appendLog("Deleted: " + (data.deleted_id || "ok"), "bot");
+      setStatus("Deleted.");
+    } catch (e) {
+      setStatus("Network error.", true);
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
     }
   }
 
@@ -861,54 +994,17 @@ PUBLIC_CHAT_HTML = r"""
   });
 
   elDownload.addEventListener("click", downloadCsv);
+  elUndo.addEventListener("click", undoLast);
+  elDelete.addEventListener("click", deleteById);
 
   updateKeyUI();
-  getOrCreateClientId(); // ensure it exists
+  getOrCreateClientId();
   appendLog("Ready.", "muted");
 })();
 </script>
 </body>
 </html>
 """
-def merchant_map_set(token: str, category: str):
-    con = _finance_conn()
-    if not con:
-        raise RuntimeError("db_not_configured")
-    token = (token or "").strip()
-    category = (category or "").strip()
-    with con:
-        with con.cursor() as cur:
-            cur.execute("""
-              INSERT INTO finance_merchant_map(token, category, updated_at)
-              VALUES (%s, %s, NOW())
-              ON CONFLICT(token)
-              DO UPDATE SET category=EXCLUDED.category, updated_at=NOW()
-            """, (token, category))
-    con.close()
-
-def merchant_map_guess_category(text: str):
-    """Very simple: if any stored token appears in text, return its category."""
-    con = _finance_conn()
-    if not con:
-        return None
-    tl = _norm(text)
-    with con:
-        with con.cursor() as cur:
-            cur.execute("SELECT token, category FROM finance_merchant_map")
-            rows = cur.fetchall()
-    con.close()
-
-    for token, cat in rows:
-        if _norm(token) in tl:
-            return cat
-    return None
-
-
-@app.after_request
-def force_utf8(resp):
-    if resp.mimetype == "application/json":
-        resp.headers["Content-Type"] = "application/json; charset=utf-8"
-    return resp
 
 
 # ---------------------------
@@ -1015,12 +1111,12 @@ def public_page(public_id):
         abort(404)
 
     resp = make_response(render_template_string(
-    PUBLIC_CHAT_HTML,
-    public_id=public_id,
-    title="Finance Clerk",
-    assistant_slug="finance_clerk",
-    requires_key=bool(_assistant_config(a).get("requires_key"))
-))
+        PUBLIC_CHAT_HTML,
+        public_id=public_id,
+        title="Finance Clerk",
+        assistant_slug="finance_clerk",
+        requires_key=bool(_assistant_config(a).get("requires_key"))
+    ))
 
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
@@ -1062,6 +1158,19 @@ def _run_assistant(rec, message: str) -> str:
     return client.chat(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
 
 
+def _ask_next_missing(missing: list) -> str:
+    if not missing:
+        return ""
+    m = missing[0]
+    if m == "amount":
+        return "Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€)."
+    if m == "property":
+        return "Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;"
+    if m == "type":
+        return "Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”)."
+    return "Λείπουν στοιχεία. Συνέχισε με ποσό/ακίνητο/τύπο."
+
+
 @app.post("/p/<public_id>/chat")
 def public_chat(public_id):
     rl = rate_limited()
@@ -1093,21 +1202,92 @@ def public_chat(public_id):
                 provided=assistant_id
             ), 400
 
-                       # --- Finance clerk (stateful wizard) ---
+        # --- Finance clerk (stateful wizard) ---
         if slug == "finance_clerk":
-            entry, missing = parse_finance_entry(message)
-            if missing:
-                if "amount" in missing:
+            if _is_greeting(message):
+                return jsonify(public_id=public_id, assistant_slug=slug,
+                               reply="Γράψε μια καταχώρηση, π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026”.")
+
+            client_id = _get_client_id_for_state(public_id)
+            norm_msg = _norm(message)
+
+            # cancel/reset current pending
+            if norm_msg in ("ακυρο", "ακυρώ", "akuro", "cancel", "reset", "clear"):
+                finance_pending_clear(public_id, client_id)
+                return jsonify(public_id=public_id, assistant_slug=slug, reply="ΟΚ, ακυρώθηκε η τρέχουσα καταχώρηση ✅")
+
+            pending = finance_pending_get(public_id, client_id) or {}
+            fields = parse_finance_fields(message)
+
+            date_in_msg = bool(_DATE_RE.search(message))
+
+            # Start new entry if message looks like one (amount + (property or type))
+            if looks_like_new_entry(fields):
+                pending = {
+                    "entry_type": fields.get("entry_type"),
+                    "property_slug": fields.get("property_slug"),
+                    "amount": fields.get("amount"),
+                    "entry_date": fields.get("entry_date"),
+                    "category": fields.get("category"),
+                    "label": fields.get("label"),
+                    "raw_text": fields.get("raw_text") or message.strip(),
+                }
+            else:
+                # If no pending and message isn't an entry, guide user
+                if not pending:
                     return jsonify(public_id=public_id, assistant_slug=slug,
-                                   reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
-                if "property" in missing:
-                    return jsonify(public_id=public_id, assistant_slug=slug,
-                                   reply="Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;")
-                if "type" in missing:
-                    return jsonify(public_id=public_id, assistant_slug=slug,
-                                   reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
+                                   reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Πλήρωσα νερό Βουρβουρού 20€” ή “Εισέπραξα Airbnb 300€”.")
+                # Merge into pending (slot filling)
+                if not pending.get("entry_type") and fields.get("entry_type"):
+                    pending["entry_type"] = fields["entry_type"]
+                if not pending.get("property_slug") and fields.get("property_slug"):
+                    pending["property_slug"] = fields["property_slug"]
+                if pending.get("amount") is None and fields.get("amount") is not None:
+                    pending["amount"] = fields["amount"]
+                if date_in_msg:
+                    pending["entry_date"] = fields.get("entry_date") or pending.get("entry_date")
+
+                # category: upgrade from uncategorized if we found a better one
+                if fields.get("category") and fields.get("category") != "uncategorized":
+                    pending["category"] = fields["category"]
+
+                if not pending.get("label") and fields.get("label"):
+                    pending["label"] = fields["label"]
+
+                # keep raw text history
+                rt = (pending.get("raw_text") or "").strip()
+                msg2 = message.strip()
+                if msg2 and msg2 not in rt:
+                    pending["raw_text"] = (rt + " | " + msg2).strip(" |")
+
+            # merchant map: if still uncategorized, try guess
+            if (pending.get("category") in (None, "", "uncategorized")):
+                guess = merchant_map_guess_category(pending.get("raw_text") or "")
+                if guess:
+                    pending["category"] = guess
+
+            miss = missing_fields(pending)
+            if miss:
+                finance_pending_upsert(public_id, client_id, pending)
+                return jsonify(public_id=public_id, assistant_slug=slug, reply=_ask_next_missing(miss))
+
+            # ready to commit
+            entry = {
+                "id": str(uuid.uuid4()),
+                "entry_date": pending.get("entry_date") or date.today().isoformat(),
+                "property_slug": pending["property_slug"],
+                "entry_type": pending["entry_type"],
+                "amount": float(pending["amount"]),
+                "currency": "EUR",
+                "category": pending.get("category") or "uncategorized",
+                "label": pending.get("label") or None,
+                "note": None,
+                "raw_text": pending.get("raw_text") or message.strip(),
+            }
 
             finance_insert(entry)
+            finance_pending_clear(public_id, client_id)
+
             return jsonify(
                 public_id=public_id,
                 assistant_slug=slug,
@@ -1121,6 +1301,185 @@ def public_chat(public_id):
     except Exception as e:
         app.logger.exception("public_chat failed")
         return jsonify(error=str(e), type=type(e).__name__), 500
+
+
+# ---------------------------
+# Finance extra endpoints
+# ---------------------------
+@app.post("/p/<public_id>/finance/undo_last")
+def finance_undo_last(public_id):
+    a, err = _finance_auth_and_get_clerk(public_id)
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    confirm = data.get("confirm") is True
+    property_slug = (data.get("property_slug") or "").strip() or None
+
+    if not confirm:
+        return jsonify(error="Need {confirm:true, property_slug?:string}"), 400
+
+    con = _finance_conn()
+    if not con:
+        return jsonify(error="db_not_configured"), 500
+
+    with con:
+        with con.cursor() as cur:
+            if property_slug:
+                cur.execute("""
+                    SELECT id
+                    FROM finance_entries
+                    WHERE property_slug=%s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """, (property_slug,))
+            else:
+                cur.execute("""
+                    SELECT id
+                    FROM finance_entries
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                """)
+            row = cur.fetchone()
+            if not row:
+                return jsonify(ok=True, message="Nothing to undo")
+
+            entry_id = row[0]
+            cur.execute("DELETE FROM finance_entries WHERE id=%s", (entry_id,))
+            if cur.rowcount == 0:
+                return jsonify(ok=True, message="Nothing to undo")
+
+    con.close()
+    return jsonify(ok=True, undone_id=entry_id, property_slug=property_slug)
+
+
+@app.post("/p/<public_id>/finance/delete")
+def finance_delete(public_id):
+    a, err = _finance_auth_and_get_clerk(public_id)
+    if err:
+        return err
+
+    data = request.get_json(silent=True) or {}
+    entry_id = (data.get("id") or "").strip()
+    confirm = data.get("confirm") is True
+
+    if not entry_id or not confirm:
+        return jsonify(error="Need {id:string, confirm:true}"), 400
+
+    con = _finance_conn()
+    if not con:
+        return jsonify(error="db_not_configured"), 500
+
+    with con:
+        with con.cursor() as cur:
+            cur.execute("DELETE FROM finance_entries WHERE id=%s", (entry_id,))
+            if cur.rowcount == 0:
+                return jsonify(error="Entry not found"), 404
+
+    con.close()
+    return jsonify(ok=True, deleted_id=entry_id)
+
+
+@app.get("/p/<public_id>/finance/recent")
+def finance_recent(public_id):
+    a, err = _finance_auth_and_get_clerk(public_id)
+    if err:
+        return err
+
+    limit = request.args.get("limit", "20")
+    try:
+        limit = max(1, min(200, int(limit)))
+    except Exception:
+        limit = 20
+
+    prop = (request.args.get("property_slug") or "").strip() or None
+
+    con = _finance_conn()
+    if not con:
+        return jsonify(error="db_not_configured"), 500
+
+    with con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            if prop:
+                cur.execute("""
+                    SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label
+                    FROM finance_entries
+                    WHERE property_slug=%s
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (prop, limit))
+            else:
+                cur.execute("""
+                    SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label
+                    FROM finance_entries
+                    ORDER BY created_at DESC
+                    LIMIT %s
+                """, (limit,))
+            rows = cur.fetchall()
+
+    con.close()
+    return jsonify(ok=True, rows=rows)
+
+
+@app.get("/p/<public_id>/finance/summary")
+def finance_summary(public_id):
+    a, err = _finance_auth_and_get_clerk(public_id)
+    if err:
+        return err
+
+    date_from = (request.args.get("from") or "").strip() or None
+    date_to = (request.args.get("to") or "").strip() or None
+    prop = (request.args.get("property_slug") or "").strip() or None
+    entry_type = (request.args.get("type") or "").strip() or None
+
+    # basic validation (ISO date)
+    def _valid_date(s):
+        if not s:
+            return True
+        try:
+            datetime.fromisoformat(s)
+            return True
+        except Exception:
+            return False
+
+    if not _valid_date(date_from) or not _valid_date(date_to):
+        return jsonify(error="Invalid date. Use YYYY-MM-DD"), 400
+
+    where = []
+    args = []
+    if prop:
+        where.append("property_slug=%s"); args.append(prop)
+    if entry_type:
+        if entry_type not in ("expense", "income"):
+            return jsonify(error="type must be expense|income"), 400
+        where.append("entry_type=%s"); args.append(entry_type)
+    if date_from:
+        where.append("entry_date>=%s"); args.append(date_from)
+    if date_to:
+        where.append("entry_date<=%s"); args.append(date_to)
+
+    sql = "SELECT entry_type, COUNT(*) AS count, COALESCE(SUM(amount),0) AS total FROM finance_entries"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " GROUP BY entry_type ORDER BY entry_type"
+
+    con = _finance_conn()
+    if not con:
+        return jsonify(error="db_not_configured"), 500
+
+    with con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            rows = cur.fetchall()
+    con.close()
+
+    # normalize output
+    out = {"expense": {"count": 0, "total": 0}, "income": {"count": 0, "total": 0}}
+    for r in rows:
+        et = r.get("entry_type")
+        out[et] = {"count": int(r.get("count") or 0), "total": float(r.get("total") or 0)}
+
+    return jsonify(ok=True, filters={"from": date_from, "to": date_to, "property_slug": prop, "type": entry_type}, summary=out)
 
 
 @app.get("/p/<public_id>/export.csv")
@@ -1147,7 +1506,7 @@ def finance_export(public_id):
         import io, csv
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["date", "property", "type", "amount", "currency", "category", "label"])
+        w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
         for r in rows:
             w.writerow([
                 r.get("entry_date"),
@@ -1157,6 +1516,7 @@ def finance_export(public_id):
                 r.get("currency", "EUR"),
                 r.get("category", ""),
                 r.get("label", ""),
+                r.get("id"),
             ])
 
         csv_text = buf.getvalue()
