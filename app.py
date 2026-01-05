@@ -557,6 +557,23 @@ PUBLIC_CHAT_HTML = """
 (function () {
   const publicId = "{{ public_id }}";
   const STORAGE_KEY = `finance_key:${publicId}`;
+const CLIENT_ID_KEY = `finance_client:${publicId}`;
+
+function getClientId() {
+  let id = (localStorage.getItem(CLIENT_ID_KEY) || "").trim();
+  if (id) return id;
+
+  try {
+    id = crypto.randomUUID();
+  } catch (e) {
+    id = "c_" + Math.random().toString(16).slice(2) + "_" + Date.now();
+  }
+  localStorage.setItem(CLIENT_ID_KEY, id);
+  return id;
+}
+
+const clientId = getClientId();
+
 
   const elKey = document.getElementById("apiKey");
   const elToggle = document.getElementById("toggleKey");
@@ -639,6 +656,11 @@ PUBLIC_CHAT_HTML = """
         headers: { "Content-Type": "application/json", "X-FINANCE-KEY": key },
         body: JSON.stringify({ assistant_id: "finance_clerk", message })
       });
+        headers: {
+       "Content-Type": "application/json",
+       "X-FINANCE-KEY": key,
+       "X-CLIENT-ID": clientId
+      },
 
       const text = await resp.text();
       let data = null;
@@ -678,6 +700,14 @@ PUBLIC_CHAT_HTML = """
         appendLog("ERROR: " + t, "err");
         return;
       }
+      const resp = await fetch(`/p/${publicId}/export.csv`, {
+  method: "GET",
+  headers: {
+    "X-FINANCE-KEY": key,
+    "X-CLIENT-ID": clientId
+  }
+});
+ 
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
