@@ -496,16 +496,16 @@ PUBLIC_CHAT_HTML = """
         return;
       }
 
-      // Try to print something useful
-      const botText = data && (data.answer || data.reply || data.message);
-appendLog(message, "user");
+      // Print server reply properly (backend uses "reply")
+appendLog("YOU: " + message);
 
+const botText = data && (data.reply || data.answer || data.message || data.error);
 if (botText) {
-  appendLog(botText, "bot");
+  appendLog("BOT: " + botText);
 } else {
-  // Αν δεν έχει "answer/reply", τύπωσε ό,τι γύρισε ο server για να μη σε δουλεύει το "OK"
-  appendLog("SERVER: " + (data ? JSON.stringify(data) : text));
+  appendLog("SERVER: " + (data ? JSON.stringify(data) : (text || "(empty response)")));
 }
+
 
 
       setStatus("Sent.");
