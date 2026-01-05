@@ -325,7 +325,8 @@ _CAT_RULES = [
     ("utilities", ["δεη", "ρεύμα", "ρευμα", "νερό", "νερο", "ιντερνετ", "internet", "κοινόχρηστα", "κοινοχρηστα"]),
     ("home_maintenance", ["συντηρ", "επισκευ", "υδραυλ", "ηλεκτρολογ", "κηπ", "garden", "service", "repair"]),
     ("groceries", ["σουπερ", "μάρκετ", "μαρκετ", "τροφ", "supermarket"]),
-    ("rental_income", ["airbnb", "booking", "ενοίκ", "ενοικ", "βραχυχρόν", "βραχυχρον"]),
+    ("rental_income", ["airbnb", "booking", "ενοίκ", "ενοικ", "βραχυχρόν", "βραχυχρον"]),("groceries", ["σουπερ","μάρκετ","μαρκετ","τροφ","supermarket","super market","souper market","souper"])
+
 ]
 
 _DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
@@ -354,6 +355,59 @@ def _detect_type(t: str):
     if any(w in tl for w in _EXPENSE_WORDS):
         return "expense"
     return None
+_LABEL_NOISE = {
+    "θεσσαλονικη","thessaloniki",
+    "βουρβουρου","vourvourou",
+    "πληρωσα","πλήρωσα",
+    "εισπραξα","εισέπραξα",
+    "εξοδο","έξοδο","εσοδο","έσοδο",
+}
+
+_NUM_ONLY_RE = re.compile(r"^\s*\d+(?:[.,]\d{1,2})?\s*$")
+
+def _label_candidate(text: str):
+    t = (text or "").strip()
+    if not t:
+        return None
+    tl = _norm(t)
+    if tl in _LABEL_NOISE:
+        return None
+    if _NUM_ONLY_RE.match(t):
+        return None
+    # Αν είναι απλά μια λέξη τύπου “Θεσσαλονίκη” μην την κάνεις label
+    if len(t.split()) == 1 and tl in _PROP_MAP.get("thessaloniki", []) + _PROP_MAP.get("vourvourou", []):
+        return None
+    return t
+
+def parse_finance_fields(text: str) -> dict:
+    return {
+        "entry_type": _detect_type(text),
+        "property_slug": _detect_property(text),
+        "amount": _detect_amount(text),
+        "entry_date": _detect_date(text),
+        "category": _detect_category(text),
+        "label": _label_candidate(text),
+        "raw_text": (text or "").strip(),
+    }
+
+def missing_fields(state: dict):
+    missing = []
+    if not state.get("entry_type"):
+        missing.append("type")
+    if not state.get("property_slug"):
+        missing.append("property")
+    if state.get("amount") is None:
+        missing.append("amount")
+    return missing
+
+def looks_like_new_entry(fields: dict) -> bool:
+    # “Νέο entry” μόνο όταν δίνει αρκετά σήματα μαζί
+    has_amount = fields.get("amount") is not None
+    has_prop = bool(fields.get("property_slug"))
+    has_type = bool(fields.get("entry_type"))
+    # safe rule: νέο entry αν έχει amount + (prop ή type) ή αν έχει και τα 3
+    return has_amount and (has_prop or has_type)
+
 
 
 def _detect_date(t: str):
@@ -987,73 +1041,10 @@ def public_chat(public_id):
                 provided=assistant_id
             ), 400
 
-                # --- Finance clerk (stateful wizard) ---
+                       # --- Finance clerk (stateful wizard) ---
         if slug == "finance_clerk":
-            # client id (cookie first; fallback header; fallback ip)
-            cid = (request.cookies.get("cid") or request.headers.get("X-CLIENT-ID") or get_client_ip()).strip()
-
-            # helper: db-backed pending state (public_id + cid)
-            pending = None
-            try:
-                pending = finance_pending_get(public_id, cid)
-            except Exception:
-                pending = None
-
-            # Heuristic: if user starts with "Πλήρωσα/Εισέπραξα..." treat as new entry
-            def _starts_new(text: str) -> bool:
-                tl = (text or "").strip().lower()
-                return any(w in tl for w in _EXPENSE_WORDS) or any(w in tl for w in _INCOME_WORDS)
-
-            is_new = _starts_new(message) or not pending
-
-            # Parse partial fields from current message
-            # (On continuation messages, don't overwrite label/category with "50" or "Θεσσαλονίκη")
-            partial = {}
-            entry_type = _detect_type(message)
-            prop = _detect_property(message)
-            amt = _detect_amount(message)
-            dt = _detect_date(message) if _DATE_RE.search(message) else None
-
-            if entry_type:
-                partial["entry_type"] = entry_type
-            if prop:
-                partial["property_slug"] = prop
-            if amt is not None:
-                partial["amount"] = amt
-            if dt:
-                partial["entry_date"] = dt
-
-            if is_new:
-                # start fresh, store label/raw_text/category from the first message
-                pending = {
-                    "entry_date": _detect_date(message),
-                    "currency": "EUR",
-                    "label": message.strip(),
-                    "raw_text": message,
-                    "category": _detect_category(message),
-                }
-            else:
-                pending = pending or {}
-
-            # merge
-            pending.update(partial)
-
-            # validate required fields
-            missing = []
-            if not pending.get("entry_type"):
-                missing.append("type")
-            if not pending.get("property_slug"):
-                missing.append("property")
-            if pending.get("amount") is None:
-                missing.append("amount")
-
+            entry, missing = parse_finance_entry(message)
             if missing:
-                # persist pending and ask the next missing field
-                try:
-                    finance_pending_upsert(public_id, cid, pending)
-                except Exception:
-                    pass
-
                 if "amount" in missing:
                     return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
@@ -1064,33 +1055,14 @@ def public_chat(public_id):
                     return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
 
-            # finalize entry
-            entry = {
-                "id": str(uuid.uuid4()),
-                "entry_date": pending.get("entry_date") or date.today().isoformat(),
-                "property_slug": pending["property_slug"],
-                "entry_type": pending["entry_type"],
-                "amount": pending["amount"],
-                "currency": pending.get("currency", "EUR"),
-                "category": pending.get("category") or _detect_category(pending.get("label") or ""),
-                "label": pending.get("label") or message.strip(),
-                "note": None,
-                "raw_text": pending.get("raw_text") or message,
-            }
-
             finance_insert(entry)
-
-            try:
-                finance_pending_clear(public_id, cid)
-            except Exception:
-                pass
-
             return jsonify(
                 public_id=public_id,
                 assistant_slug=slug,
                 reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
             )
 
+        # --- Default: LLM assistant ---
         reply_text = _run_assistant(a, message)
         return jsonify(public_id=public_id, assistant_slug=slug, reply=reply_text)
 
