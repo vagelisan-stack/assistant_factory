@@ -494,13 +494,16 @@ PUBLIC_CHAT_HTML = """
       }
 
       // Try to print something useful
-      if (data && data.answer) {
-        appendLog("YOU: " + message);
-        appendLog("BOT: " + data.answer);
-      } else {
-        appendLog("YOU: " + message);
-        appendLog("OK");
-      }
+      const botText = data && (data.answer || data.reply || data.message);
+appendLog("YOU: " + message);
+
+if (botText) {
+  appendLog("BOT: " + botText);
+} else {
+  // Αν δεν έχει "answer/reply", τύπωσε ό,τι γύρισε ο server για να μη σε δουλεύει το "OK"
+  appendLog("SERVER: " + (data ? JSON.stringify(data) : text));
+}
+
 
       setStatus("Sent.");
     } catch (e) {
