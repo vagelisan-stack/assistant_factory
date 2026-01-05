@@ -484,22 +484,27 @@ bootstrap_db_from_filesystem()
 # ---------------------------
 # Public page HTML
 # ---------------------------
-PUBLIC_CHAT_HTML = """
+PUBLIC_CHAT_HTML = r"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Finance Clerk</title>
+  <title>{{ title or "Assistant" }}</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 18px; background: #fff; color: #111; }
     .wrap { max-width: 900px; margin: 0 auto; }
     .muted { color:#666; font-size: 0.95rem; }
     .card { border:1px solid #e5e5e5; border-radius: 12px; padding: 12px; margin: 12px 0; }
     .row { display:flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    input[type="password"], input[type="text"], textarea { border:1px solid #ccc; border-radius: 10px; padding: 10px; font-size: 1rem; }
+    input[type="password"], input[type="text"], textarea {
+      border:1px solid #ccc; border-radius: 10px; padding: 10px; font-size: 1rem;
+    }
     textarea { width: 100%; min-height: 90px; resize: vertical; }
-    button { border:1px solid #ccc; background:#f7f7f7; border-radius: 10px; padding: 10px 14px; cursor:pointer; font-size: 1rem; }
+    button {
+      border:1px solid #ccc; background:#f7f7f7; border-radius: 10px;
+      padding: 10px 14px; cursor:pointer; font-size: 1rem;
+    }
     button:hover { background:#efefef; }
     button.primary { background:#111; color:#fff; border-color:#111; }
     button.primary:hover { background:#000; }
@@ -513,15 +518,15 @@ PUBLIC_CHAT_HTML = """
 </head>
 <body>
   <div class="wrap">
-    <h2>Finance Clerk</h2>
+    <h2>{{ title or "Assistant" }}</h2>
     <div class="muted">Key is stored locally in your browser (one-time per device).</div>
 
-    <div class="card" id="keyBox">
+    <div class="card" id="keyBox" style="{{ '' if requires_key else 'display:none;' }}">
       <div class="row">
         <input id="apiKey" type="password" placeholder="Paste finance key once" autocomplete="off" style="min-width: 280px;">
-        <button id="toggleKey">Show</button>
-        <button id="saveKey" class="primary">Save</button>
-        <button id="forgetKey">Forget</button>
+        <button id="toggleKey" type="button">Show</button>
+        <button id="saveKey" class="primary" type="button">Save</button>
+        <button id="forgetKey" type="button">Forget</button>
         <span id="keyStatus" class="pill"></span>
       </div>
       <div class="muted" style="margin-top:8px;">
@@ -536,7 +541,7 @@ PUBLIC_CHAT_HTML = """
           <div class="muted">Example: “Πλήρωσα κήπο Βουρβουρού 60€ 2/1/2026”</div>
         </div>
         <div class="row">
-          <button id="downloadCsv">Download CSV</button>
+          <button id="downloadCsv" type="button">Download CSV</button>
         </div>
       </div>
 
@@ -547,7 +552,7 @@ PUBLIC_CHAT_HTML = """
       </div>
 
       <div class="row" style="margin-top:10px;">
-        <button id="send" class="primary">Send</button>
+        <button id="send" class="primary" type="button">Send</button>
         <span id="status" class="muted"></span>
       </div>
     </div>
@@ -556,24 +561,11 @@ PUBLIC_CHAT_HTML = """
 <script>
 (function () {
   const publicId = "{{ public_id }}";
+  const assistantSlug = "{{ assistant_slug }}";
+  const requiresKey = {{ "true" if requires_key else "false" }};
+
   const STORAGE_KEY = `finance_key:${publicId}`;
-const CLIENT_ID_KEY = `finance_client:${publicId}`;
-
-function getClientId() {
-  let id = (localStorage.getItem(CLIENT_ID_KEY) || "").trim();
-  if (id) return id;
-
-  try {
-    id = crypto.randomUUID();
-  } catch (e) {
-    id = "c_" + Math.random().toString(16).slice(2) + "_" + Date.now();
-  }
-  localStorage.setItem(CLIENT_ID_KEY, id);
-  return id;
-}
-
-const clientId = getClientId();
-
+  const CLIENT_KEY  = `client_id:${publicId}`;
 
   const elKey = document.getElementById("apiKey");
   const elToggle = document.getElementById("toggleKey");
@@ -586,10 +578,6 @@ const clientId = getClientId();
   const elSend = document.getElementById("send");
   const elStatus = document.getElementById("status");
   const elDownload = document.getElementById("downloadCsv");
-
-  function getSavedKey() { return (localStorage.getItem(STORAGE_KEY) || "").trim(); }
-  function setSavedKey(k) { localStorage.setItem(STORAGE_KEY, (k || "").trim()); }
-  function clearSavedKey() { localStorage.removeItem(STORAGE_KEY); }
 
   function setStatus(text, isError=false) {
     elStatus.textContent = text || "";
@@ -604,7 +592,47 @@ const clientId = getClientId();
     elLog.scrollTop = elLog.scrollHeight;
   }
 
+  function safeGet(key) {
+    try { return (localStorage.getItem(key) || "").trim(); }
+    catch (e) { return ""; }
+  }
+  function safeSet(key, val) {
+    try { localStorage.setItem(key, (val || "").trim()); return true; }
+    catch (e) {
+      console.error("localStorage set failed:", e);
+      setStatus("Browser storage blocked. Allow site data / disable strict privacy mode.", true);
+      return false;
+    }
+  }
+  function safeRemove(key) {
+    try { localStorage.removeItem(key); return true; }
+    catch (e) { return false; }
+  }
+
+  function uuidLike() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      const v = c === "x" ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  function getOrCreateClientId() {
+    let id = safeGet(CLIENT_KEY);
+    if (!id) {
+      id = uuidLike();
+      safeSet(CLIENT_KEY, id);
+    }
+    return id;
+  }
+
+  function getSavedKey() { return safeGet(STORAGE_KEY); }
+  function setSavedKey(k) { return safeSet(STORAGE_KEY, k); }
+  function clearSavedKey() { return safeRemove(STORAGE_KEY); }
+
   function updateKeyUI() {
+    if (!requiresKey) return;
     const has = !!getSavedKey();
     elKeyStatus.textContent = has ? "Key saved" : "No key saved";
     elKeyStatus.className = has ? "pill ok" : "pill err";
@@ -621,31 +649,43 @@ const clientId = getClientId();
     }
   } catch (e) {}
 
-  elToggle.addEventListener("click", () => {
-    if (elKey.type === "password") { elKey.type = "text"; elToggle.textContent = "Hide"; }
-    else { elKey.type = "password"; elToggle.textContent = "Show"; }
-  });
+  if (requiresKey) {
+    elToggle.addEventListener("click", () => {
+      if (elKey.type === "password") {
+        elKey.type = "text";
+        elToggle.textContent = "Hide";
+      } else {
+        elKey.type = "password";
+        elToggle.textContent = "Show";
+      }
+    });
 
-  elSave.addEventListener("click", () => {
-    const k = (elKey.value || "").trim();
-    if (!k) { alert("Paste the finance key first."); return; }
-    setSavedKey(k);
-    elKey.value = "";
-    elKey.type = "password";
-    elToggle.textContent = "Show";
-    updateKeyUI();
-    setStatus("Key saved.");
-  });
+    elSave.addEventListener("click", () => {
+      const k = (elKey.value || "").trim();
+      if (!k) { alert("Paste the finance key first."); return; }
+      if (!setSavedKey(k)) return;
+      elKey.value = "";
+      elKey.type = "password";
+      elToggle.textContent = "Show";
+      updateKeyUI();
+      setStatus("Key saved.");
+    });
 
-  elForget.addEventListener("click", () => {
-    clearSavedKey();
-    updateKeyUI();
-    setStatus("Key removed.");
-  });
+    elForget.addEventListener("click", () => {
+      clearSavedKey();
+      updateKeyUI();
+      setStatus("Key removed.");
+    });
+  }
 
   async function postChat(message) {
-    const key = getSavedKey();
-    if (!key) { alert("No finance key saved. Paste it once and hit Save."); return; }
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
+
+    if (requiresKey && !key) {
+      alert("No finance key saved. Paste it once and hit Save.");
+      return;
+    }
 
     setStatus("Sending...");
     elSend.disabled = true;
@@ -653,75 +693,81 @@ const clientId = getClientId();
     try {
       const resp = await fetch(`/p/${publicId}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-FINANCE-KEY": key },
-        body: JSON.stringify({ assistant_id: "finance_clerk", message })
-      });
         headers: {
-       "Content-Type": "application/json",
-       "X-FINANCE-KEY": key,
-       "X-CLIENT-ID": clientId
-      },
+          "Content-Type": "application/json",
+          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+          "X-CLIENT-ID": clientId
+        },
+        body: JSON.stringify({ assistant_id: assistantSlug, message })
+      });
 
       const text = await resp.text();
       let data = null;
       try { data = JSON.parse(text); } catch (e) {}
 
+      appendLog("YOU: " + message, "user");
+
       if (!resp.ok) {
         const errMsg = data && (data.error || data.message) ? (data.error || data.message) : text;
-        setStatus("Error sending message.", true);
-        appendLog("ERROR: " + errMsg, "err");
+        setStatus("Error.", true);
+        appendLog("BOT: ERROR: " + errMsg, "err");
         return;
       }
 
-      appendLog("YOU: " + message, "user");
       const botText = data && (data.reply || data.answer || data.message || data.error);
-      if (botText) appendLog("BOT: " + botText, "bot");
-      else appendLog("SERVER: " + (data ? JSON.stringify(data) : (text || "(empty response)")));
-
+      appendLog("BOT: " + (botText || "(empty)"), "bot");
       setStatus("Sent.");
     } catch (e) {
       setStatus("Network error.", true);
-      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+      appendLog("BOT: ERROR: " + (e && e.message ? e.message : String(e)), "err");
     } finally {
       elSend.disabled = false;
     }
   }
 
   async function downloadCsv() {
-    const key = getSavedKey();
-    if (!key) { alert("No finance key saved. Paste it once and hit Save."); return; }
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
+
+    if (requiresKey && !key) {
+      alert("No finance key saved. Paste it once and hit Save.");
+      return;
+    }
 
     setStatus("Downloading CSV...");
     try {
-      const resp = await fetch(`/p/${publicId}/export.csv`, { method: "GET", headers: { "X-FINANCE-KEY": key } });
+      const resp = await fetch(`/p/${publicId}/export.csv`, {
+        method: "GET",
+        headers: {
+          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+          "X-CLIENT-ID": clientId
+        }
+      });
+
       if (!resp.ok) {
         const t = await resp.text();
         setStatus("CSV download failed.", true);
-        appendLog("ERROR: " + t, "err");
+        appendLog("BOT: ERROR: " + t, "err");
         return;
       }
-      const resp = await fetch(`/p/${publicId}/export.csv`, {
-  method: "GET",
-  headers: {
-    "X-FINANCE-KEY": key,
-    "X-CLIENT-ID": clientId
-  }
-});
- 
+
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
+
       const a = document.createElement("a");
-      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      const now = new Date();
+      const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
       a.href = url;
       a.download = `finance_${publicId}_${stamp}.csv`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
+
       setStatus("CSV downloaded.");
     } catch (e) {
       setStatus("Network error.", true);
-      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+      appendLog("BOT: ERROR: " + (e && e.message ? e.message : String(e)), "err");
     }
   }
 
@@ -732,14 +778,19 @@ const clientId = getClientId();
     postChat(m);
   });
 
+  // Enter to send, Shift+Enter for newline
   elMsg.addEventListener("keydown", (ev) => {
-    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); elSend.click(); }
+    if (ev.key === "Enter" && !ev.shiftKey) {
+      ev.preventDefault();
+      elSend.click();
+    }
   });
 
   elDownload.addEventListener("click", downloadCsv);
 
   updateKeyUI();
-  appendLog("Ready. Save key once, then start logging expenses.", "muted");
+  getOrCreateClientId(); // ensure it exists
+  appendLog("Ready.", "muted");
 })();
 </script>
 </body>
@@ -857,7 +908,14 @@ def public_page(public_id):
     if a is None or not _assistant_enabled(a):
         abort(404)
 
-    resp = make_response(render_template_string(PUBLIC_CHAT_HTML, public_id=public_id))
+    resp = make_response(render_template_string(
+    PUBLIC_CHAT_HTML,
+    public_id=public_id,
+    title="Finance Clerk",
+    assistant_slug="finance_clerk",
+    requires_key=bool(_assistant_config(a).get("requires_key"))
+))
+
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
