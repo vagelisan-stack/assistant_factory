@@ -300,7 +300,7 @@ def bootstrap_db_from_filesystem() -> None:
             )
         except Exception:
             continue
-
+6
 
 bootstrap_db_from_filesystem()
 
@@ -332,6 +332,8 @@ PUBLIC_CHAT_HTML = """
     #log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.95rem; }
     .err { color:#b00020; }
     .ok { color:#0a7b34; }
+  .line.user { font-weight: 600; }
+  .line.bot  { margin-left: 14px; }
   </style>
 </head>
 <body>
@@ -409,12 +411,13 @@ PUBLIC_CHAT_HTML = """
   }
 
   function appendLog(text, cls) {
-    const line = document.createElement("div");
-    if (cls) line.className = cls;
-    line.textContent = text;
-    elLog.appendChild(line);
-    elLog.scrollTop = elLog.scrollHeight;
-  }
+  const line = document.createElement("div");
+  line.className = "line" + (cls ? (" " + cls) : "");
+  line.textContent = text;
+  elLog.appendChild(line);
+  elLog.scrollTop = elLog.scrollHeight;
+}
+
 
   function updateKeyUI() {
     const has = !!getSavedKey();
@@ -495,10 +498,10 @@ PUBLIC_CHAT_HTML = """
 
       // Try to print something useful
       const botText = data && (data.answer || data.reply || data.message);
-appendLog("YOU: " + message);
+appendLog(message, "user");
 
 if (botText) {
-  appendLog("BOT: " + botText);
+  appendLog(botText, "bot");
 } else {
   // Αν δεν έχει "answer/reply", τύπωσε ό,τι γύρισε ο server για να μη σε δουλεύει το "OK"
   appendLog("SERVER: " + (data ? JSON.stringify(data) : text));
