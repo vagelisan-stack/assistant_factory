@@ -80,20 +80,14 @@ def ensure_finance_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_date ON finance_entries(entry_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
 
-            # ✅ ΕΔΩ ΜΠΑΙΝΕΙ (μέσα στο cursor)
+            # NEW: merchant memory
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS finance_wizard_state (
-              public_id TEXT NOT NULL,
-              client_id TEXT NOT NULL,
-              assistant_slug TEXT NOT NULL,
-              base_text TEXT NOT NULL,
-              combined_text TEXT NOT NULL,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              PRIMARY KEY (public_id, client_id, assistant_slug)
+            CREATE TABLE IF NOT EXISTS finance_merchant_map (
+              token TEXT PRIMARY KEY,
+              category TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_finwiz_updated ON finance_wizard_state(updated_at);")
-
     con.close()
 
 def ensure_finance_pending_schema():
@@ -328,7 +322,12 @@ def rate_limited():
 # ---------------------------
 # Finance parsing (Greek-friendly)
 # ---------------------------
-_EXPENSE_WORDS = ["πλήρωσα", "εδωσα", "έδωσα", "αγόρασα", "αγορασα", "ψώνισα", "ψωνισα", "χρεώθηκα", "χρεωθηκα"]
+_EXPENSE_WORDS = ["πλήρωσα", "εδωσα", "έδωσα", "αγόρασα", "αγορασα", "ψώνισα", "ψωνισα", "χρεώθηκα", "χρεωθηκα","πλήρωσα", "πληρωσα",
+    "εδωσα", "έδωσα",
+    "αγόρασα", "αγορασα",
+    "ψώνισα", "ψωνισα",
+    "χρεώθηκα", "χρεωθηκα",
+]
 _INCOME_WORDS  = ["εισέπραξα", "εισπραξα", "πήρα", "πηρα", "πληρώθηκα", "πληρωθηκα", "έλαβα", "ελαβα", "μπήκαν", "μπηκαν"]
 
 _PROP_MAP = {
@@ -337,11 +336,17 @@ _PROP_MAP = {
 }
 
 _CAT_RULES = [
-    ("utilities", ["δεη", "ρεύμα", "ρευμα", "νερό", "νερο", "ιντερνετ", "internet", "κοινόχρηστα", "κοινοχρηστα"]),
-    ("home_maintenance", ["συντηρ", "επισκευ", "υδραυλ", "ηλεκτρολογ", "κηπ", "garden", "service", "repair"]),
-    ("groceries", ["σουπερ", "μάρκετ", "μαρκετ", "τροφ", "supermarket"]),
-    ("rental_income", ["airbnb", "booking", "ενοίκ", "ενοικ", "βραχυχρόν", "βραχυχρον"]),("groceries", ["σουπερ","μάρκετ","μαρκετ","τροφ","supermarket","super market","souper market","souper"])
-
+    ("utilities", ["δεη","ρεύμα","ρευμα","νερό","νερο","ιντερνετ","internet","κοινόχρηστα","κοινοχρηστα"]),
+    ("home_maintenance", ["συντηρ","επισκευ","υδραυλ","ηλεκτρολογ","κηπ","garden","service","repair"]),
+    ("groceries", [
+        "σουπερ", "μάρκετ", "μαρκετ", "τροφ", "supermarket",
+        "super market", "mini market", "minimarket",
+        "souper", "supper", "super mart"
+    ]),
+    ("transport", ["parking","παρκινγκ","διόδια","διοδια","βενζιν","fuel","diesel","κτεο","service αυτοκιν","αντιπροσωπ","ασφαλεια αυτοκιν"]),
+    ("dining", ["εστιατ","restaurant","ταβερν","taverna","φαγητο","γεύμα"]),
+    ("bars_coffee", ["καφε","coffee","μπαρ","bar","ποτο","drink","cocktail"]),
+    ("rental_income", ["airbnb","booking","ενοίκ","ενοικ","βραχυχρόν","βραχυχρον"]),
 ]
 
 _DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
@@ -362,14 +367,14 @@ def _detect_property(t: str):
                 return slug
     return None
 
-
 def _detect_type(t: str):
-    tl = t.lower()
-    if any(w in tl for w in _INCOME_WORDS):
+    tl = _norm(t)
+    if any(_norm(w) in tl for w in _INCOME_WORDS):
         return "income"
-    if any(w in tl for w in _EXPENSE_WORDS):
+    if any(_norm(w) in tl for w in _EXPENSE_WORDS):
         return "expense"
     return None
+
 _LABEL_NOISE = {
     "θεσσαλονικη","thessaloniki",
     "βουρβουρου","vourvourou",
@@ -865,6 +870,38 @@ PUBLIC_CHAT_HTML = r"""
 </body>
 </html>
 """
+def merchant_map_set(token: str, category: str):
+    con = _finance_conn()
+    if not con:
+        raise RuntimeError("db_not_configured")
+    token = (token or "").strip()
+    category = (category or "").strip()
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+              INSERT INTO finance_merchant_map(token, category, updated_at)
+              VALUES (%s, %s, NOW())
+              ON CONFLICT(token)
+              DO UPDATE SET category=EXCLUDED.category, updated_at=NOW()
+            """, (token, category))
+    con.close()
+
+def merchant_map_guess_category(text: str):
+    """Very simple: if any stored token appears in text, return its category."""
+    con = _finance_conn()
+    if not con:
+        return None
+    tl = _norm(text)
+    with con:
+        with con.cursor() as cur:
+            cur.execute("SELECT token, category FROM finance_merchant_map")
+            rows = cur.fetchall()
+    con.close()
+
+    for token, cat in rows:
+        if _norm(token) in tl:
+            return cat
+    return None
 
 
 @app.after_request
