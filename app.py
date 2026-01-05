@@ -20,7 +20,7 @@ from assistant_store import AssistantStore
 from llm_client import MistralClient
 from db_store import DBAssistantStore
 
-APP_BUILD = "b1bc6c4"
+APP_BUILD = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()[:7] or "dev"
 
 # Load .env ONCE, early
 load_dotenv(override=True)
