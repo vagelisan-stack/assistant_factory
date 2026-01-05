@@ -81,6 +81,67 @@ def ensure_finance_schema():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
     con.close()
 
+def ensure_finance_pending_schema():
+    con = _finance_conn()
+    if not con:
+        return
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS finance_pending (
+              public_id TEXT NOT NULL,
+              client_id TEXT NOT NULL,
+              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              data TEXT NOT NULL,
+              PRIMARY KEY (public_id, client_id)
+            );
+            """)
+    con.close()
+
+def finance_pending_get(public_id: str, client_id: str):
+    ensure_finance_pending_schema()
+    con = _finance_conn()
+    if not con:
+        return None
+    with con:
+        with con.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT data FROM finance_pending WHERE public_id=%s AND client_id=%s", (public_id, client_id))
+            row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row["data"])
+    except Exception:
+        return None
+
+def finance_pending_upsert(public_id: str, client_id: str, data: dict):
+    ensure_finance_pending_schema()
+    con = _finance_conn()
+    if not con:
+        return
+    payload = json.dumps(data, ensure_ascii=False)
+    with con:
+        with con.cursor() as cur:
+            cur.execute("""
+            INSERT INTO finance_pending (public_id, client_id, data, updated_at)
+            VALUES (%s,%s,%s,NOW())
+            ON CONFLICT (public_id, client_id)
+            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
+            """, (public_id, client_id, payload))
+    con.close()
+
+def finance_pending_clear(public_id: str, client_id: str):
+    ensure_finance_pending_schema()
+    con = _finance_conn()
+    if not con:
+        return
+    with con:
+        with con.cursor() as cur:
+            cur.execute("DELETE FROM finance_pending WHERE public_id=%s AND client_id=%s", (public_id, client_id))
+    con.close()
+
+
 
 def finance_insert(entry: dict):
     con = _finance_conn()
@@ -838,10 +899,73 @@ def public_chat(public_id):
                 provided=assistant_id
             ), 400
 
-        # Finance clerk shortcut
+                # --- Finance clerk (stateful wizard) ---
         if slug == "finance_clerk":
-            entry, missing = parse_finance_entry(message)
+            # client id (cookie first; fallback header; fallback ip)
+            cid = (request.cookies.get("cid") or request.headers.get("X-CLIENT-ID") or get_client_ip()).strip()
+
+            # helper: db-backed pending state (public_id + cid)
+            pending = None
+            try:
+                pending = finance_pending_get(public_id, cid)
+            except Exception:
+                pending = None
+
+            # Heuristic: if user starts with "Πλήρωσα/Εισέπραξα..." treat as new entry
+            def _starts_new(text: str) -> bool:
+                tl = (text or "").strip().lower()
+                return any(w in tl for w in _EXPENSE_WORDS) or any(w in tl for w in _INCOME_WORDS)
+
+            is_new = _starts_new(message) or not pending
+
+            # Parse partial fields from current message
+            # (On continuation messages, don't overwrite label/category with "50" or "Θεσσαλονίκη")
+            partial = {}
+            entry_type = _detect_type(message)
+            prop = _detect_property(message)
+            amt = _detect_amount(message)
+            dt = _detect_date(message) if _DATE_RE.search(message) else None
+
+            if entry_type:
+                partial["entry_type"] = entry_type
+            if prop:
+                partial["property_slug"] = prop
+            if amt is not None:
+                partial["amount"] = amt
+            if dt:
+                partial["entry_date"] = dt
+
+            if is_new:
+                # start fresh, store label/raw_text/category from the first message
+                pending = {
+                    "entry_date": _detect_date(message),
+                    "currency": "EUR",
+                    "label": message.strip(),
+                    "raw_text": message,
+                    "category": _detect_category(message),
+                }
+            else:
+                pending = pending or {}
+
+            # merge
+            pending.update(partial)
+
+            # validate required fields
+            missing = []
+            if not pending.get("entry_type"):
+                missing.append("type")
+            if not pending.get("property_slug"):
+                missing.append("property")
+            if pending.get("amount") is None:
+                missing.append("amount")
+
             if missing:
+                # persist pending and ask the next missing field
+                try:
+                    finance_pending_upsert(public_id, cid, pending)
+                except Exception:
+                    pass
+
                 if "amount" in missing:
                     return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€).")
@@ -852,14 +976,33 @@ def public_chat(public_id):
                     return jsonify(public_id=public_id, assistant_slug=slug,
                                    reply="Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”).")
 
+            # finalize entry
+            entry = {
+                "id": str(uuid.uuid4()),
+                "entry_date": pending.get("entry_date") or date.today().isoformat(),
+                "property_slug": pending["property_slug"],
+                "entry_type": pending["entry_type"],
+                "amount": pending["amount"],
+                "currency": pending.get("currency", "EUR"),
+                "category": pending.get("category") or _detect_category(pending.get("label") or ""),
+                "label": pending.get("label") or message.strip(),
+                "note": None,
+                "raw_text": pending.get("raw_text") or message,
+            }
+
             finance_insert(entry)
+
+            try:
+                finance_pending_clear(public_id, cid)
+            except Exception:
+                pass
+
             return jsonify(
                 public_id=public_id,
                 assistant_slug=slug,
                 reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
             )
 
-        # Default LLM assistant
         reply_text = _run_assistant(a, message)
         return jsonify(public_id=public_id, assistant_slug=slug, reply=reply_text)
 
