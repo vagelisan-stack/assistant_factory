@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from collections import defaultdict, deque
 from functools import wraps
@@ -24,6 +24,9 @@ APP_BUILD = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").st
 
 # Load .env ONCE, early
 load_dotenv(override=True)
+
+APP_STARTED_AT = datetime.now(timezone.utc).isoformat()
+
 
 # ---------- Paths / Store ----------
 BASE_DIR = Path(__file__).resolve().parent
@@ -1014,12 +1017,13 @@ PUBLIC_CHAT_HTML = r"""
 def health():
     assistants = STORE.list(enabled_only=False)
     return jsonify(
-        ok=True,
-        build=APP_BUILD,
-        assistants_dir=str(ASSISTANTS_DIR),
-        assistants_count=len(assistants),
-        db_enabled=bool(db_store),
-    )
+    ok=True,
+    build=APP_BUILD,
+    started_at=APP_STARTED_AT,
+    assistants_dir=str(ASSISTANTS_DIR),
+    assistants_count=len(assistants),
+    db_enabled=bool(db_store),
+)
 
 
 @app.post("/admin/reset_finance")
