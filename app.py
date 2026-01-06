@@ -39,6 +39,29 @@ STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
 
 # ---------- Flask ----------
 app = Flask(__name__)
+import logging
+from werkzeug.exceptions import HTTPException
+
+DEBUG_MODE = (os.getenv("FLASK_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
+
+@app.errorhandler(Exception)
+def _handle_any_exception(e):
+    # Always log full traceback to server console
+    app.logger.exception("Unhandled exception")
+    if isinstance(e, HTTPException):
+        return jsonify(error=e.name, detail=e.description), (e.code or 500)
+
+    # For local debugging only
+    if DEBUG_MODE:
+        return jsonify(
+            error="server_error",
+            type=e.__class__.__name__,
+            detail=str(e),
+        ), 500
+
+    # Production-safe generic error
+    return jsonify(error="server_error"), 500
+
 app.json.ensure_ascii = False
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
@@ -229,6 +252,16 @@ def finance_list(
             rows = cur.fetchall()
     con.close()
     return rows
+@app.errorhandler(Exception)
+def _json_errors(e):
+    app.logger.exception("Unhandled exception")
+    if isinstance(e, HTTPException):
+        return jsonify(error=e.name, detail=e.description), (e.code or 500)
+
+    # Μη διαρρέεις λεπτομέρειες σε production
+    if (os.getenv("FLASK_DEBUG") or "").strip() in ("1", "true", "True"):
+        return jsonify(error="server_error", detail=str(e)), 500
+    return jsonify(error="server_error"), 500
 
 
 # ---------------------------
@@ -832,19 +865,44 @@ PUBLIC_CHAT_HTML = r"""
     });
   }
 
-      const botText = data && (data.reply || data.answer || data.message || data.error);
-      appendLog(botText || "(empty)", "bot");
-      if (data && data.download_url) {
-        // auto download report CSV with auth headers
-        setStatus("Downloading report CSV...");
-        await downloadWithAuth(data.download_url, `report_${publicId}`);
-        appendLog("Report CSV downloaded.", "bot");
-      }
-    
-      }
+  async function downloadWithAuth(path, filenamePrefix) {
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
 
-      setStatus("Sent.");
+    if (requiresKey && !key) {
+      throw new Error("No finance key saved.");
+    }
 
+    const resp = await fetch(path, {
+      method: "GET",
+      headers: {
+        ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+        "X-CLIENT-ID": clientId
+      }
+    });
+
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(t || "download_failed");
+    }
+
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    a.href = url;
+    a.download = `${filenamePrefix}_${stamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function postChat(message) {
+    const clientId = getOrCreateClientId();
+    const key = requiresKey ? getSavedKey() : "";
 
     if (requiresKey && !key) {
       alert("No finance key saved. Paste it once and hit Save.");
@@ -872,7 +930,7 @@ PUBLIC_CHAT_HTML = r"""
       appendLog(message, "user");
 
       if (!resp.ok) {
-        const errMsg = data && (data.error || data.message) ? (data.error || data.message) : text;
+        const errMsg = (data && (data.error || data.message || data.detail)) ? (data.error || data.message || data.detail) : text;
         setStatus("Error.", true);
         appendLog("ERROR: " + errMsg, "err");
         return;
@@ -880,6 +938,20 @@ PUBLIC_CHAT_HTML = r"""
 
       const botText = data && (data.reply || data.answer || data.message || data.error);
       appendLog(botText || "(empty)", "bot");
+
+      // Auto-download report CSV if backend provided a download_url
+      if (data && data.download_url) {
+        try {
+          setStatus("Downloading report CSV...");
+          await downloadWithAuth(data.download_url, `report_${publicId}`);
+          appendLog("Report CSV downloaded.", "bot");
+        } catch (e) {
+          appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+          setStatus("Report download failed.", true);
+          return;
+        }
+      }
+
       setStatus("Sent.");
     } catch (e) {
       setStatus("Network error.", true);
@@ -889,94 +961,16 @@ PUBLIC_CHAT_HTML = r"""
     }
   }
 
-  async function downloadWithAuth(path, filenamePrefix) {
-    const clientId = getOrCreateClientId();
+  async function downloadCsv() {
     const key = requiresKey ? getSavedKey() : "";
-
-    if (requiresKey && !key) {
-      alert("No finance key saved. Paste it once and hit Save.");
-      return;
-    }
+    if (requiresKey && !key) { alert("No finance key saved. Paste it once and hit Save."); return; }
 
     try {
-      const resp = await fetch(path, {
-        method: "GET",
-        headers: {
-          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
-          "X-CLIENT-ID": clientId
-        }
-      });
-
-      if (!resp.ok) {
-        const t = await resp.text();
-        setStatus("Download failed.", true);
-        appendLog("ERROR: " + t, "err");
-        return;
-      }
-
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-
-      const a = document.createElement("a");
-      const now = new Date();
-      const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      a.href = url;
-      a.download = `${filenamePrefix}_${stamp}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-
-      setStatus("Downloaded.");
-    } catch (e) {
-      setStatus("Network error.", true);
-      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
-    }
-  }
-
-    async function downloadCsv() {
-    setStatus("Downloading CSV...");
-    await downloadWithAuth(`/p/${publicId}/export.csv`, `finance_${publicId}`);
-  }
-
-    if (requiresKey && !key) {
-      alert("No finance key saved. Paste it once and hit Save.");
-      return;
-    }
-
-    setStatus("Downloading CSV...");
-    try {
-      const resp = await fetch(`/p/${publicId}/export.csv`, {
-        method: "GET",
-        headers: {
-          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
-          "X-CLIENT-ID": clientId
-        }
-      });
-
-      if (!resp.ok) {
-        const t = await resp.text();
-        setStatus("CSV download failed.", true);
-        appendLog("ERROR: " + t, "err");
-        return;
-      }
-
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-
-      const a = document.createElement("a");
-      const now = new Date();
-      const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      a.href = url;
-      a.download = `finance_${publicId}_${stamp}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-
+      setStatus("Downloading CSV...");
+      await downloadWithAuth(`/p/${publicId}/export.csv`, `finance_${publicId}`);
       setStatus("CSV downloaded.");
     } catch (e) {
-      setStatus("Network error.", true);
+      setStatus("CSV download failed.", true);
       appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
     }
   }
@@ -1080,9 +1074,6 @@ PUBLIC_CHAT_HTML = r"""
   appendLog("Ready.", "muted");
 })();
 </script>
-</body>
-</html>
-"""
 
 
 # ---------------------------
@@ -1248,7 +1239,233 @@ def _ask_next_missing(missing: list) -> str:
     if m == "type":
         return "Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”)."
     return "Λείπουν στοιχεία. Συνέχισε με ποσό/ακίνητο/τύπο."
+import calendar
+from urllib.parse import urlencode
 
+REPORT_PREFIXES = ("report", "αναφορά", "αναφορα")
+
+def _strip_accents(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return s
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = _strip_accents(s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+_PROPERTY_ALIASES = {
+    "thessaloniki": "thessaloniki",
+    "thessaloniki ": "thessaloniki",
+    "θεσσαλονικη": "thessaloniki",
+    "vourvourou": "vourvourou",
+    "βουρβουρου": "vourvourou",
+}
+
+def _detect_property_slug(msg: str) -> str | None:
+    m = _norm(msg)
+    for k, v in _PROPERTY_ALIASES.items():
+        if k in m:
+            return v
+    # last resort: accept slugs if user typed them
+    for slug in ("thessaloniki", "vourvourou"):
+        if re.search(rf"\b{slug}\b", m):
+            return slug
+    return None
+
+def _detect_entry_type(msg: str) -> str | None:
+    m = _norm(msg)
+    if re.search(r"\b(expense|expenses)\b", m) or "εξοδ" in m:
+        return "expense"
+    if re.search(r"\b(income)\b", m) or "εσοδ" in m:
+        return "income"
+    return None
+
+def _parse_date_token(tok: str) -> str | None:
+    tok = (tok or "").strip()
+    if not tok:
+        return None
+
+    # YYYY-MM-DD
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok):
+        return tok
+
+    # D/M/YY or D/M/YYYY
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", tok)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return date(y, mo, d).isoformat()
+        except Exception:
+            return None
+
+    return None
+
+def _month_range(ym: str) -> tuple[str, str] | None:
+    # ym: YYYY-MM
+    if not re.fullmatch(r"\d{4}-\d{2}", ym or ""):
+        return None
+    y = int(ym[:4]); m = int(ym[5:7])
+    last = calendar.monthrange(y, m)[1]
+    return (date(y, m, 1).isoformat(), date(y, m, last).isoformat())
+
+def _parse_report_request(message: str) -> dict | None:
+    raw = (message or "").strip()
+    if not raw:
+        return None
+
+    low = _norm(raw)
+    if not any(low.startswith(p) for p in REPORT_PREFIXES):
+        return None
+
+    entry_type = _detect_entry_type(raw)
+    property_slug = _detect_property_slug(raw)
+
+    # date range detection
+    date_from = None
+    date_to = None
+
+    # month commands: "report month" / "αναφορά μήνα" + optional YYYY-MM
+    if (" month" in low) or (" μηνα" in low) or (" μηνας" in low) or low.startswith("report month") or low.startswith("αναφορα μηνα") or low.startswith("αναφορα μηνας"):
+        m = re.search(r"\b(\d{4}-\d{2})\b", low)
+        if m:
+            rng = _month_range(m.group(1))
+        else:
+            today = date.today()
+            rng = _month_range(f"{today.year:04d}-{today.month:02d}")
+        if rng:
+            date_from, date_to = rng
+
+    # range commands: "report range 2026-01-02 2026-01-07"
+    if not date_from:
+        m = re.search(r"\brange\s+(\S+)\s+(\S+)", low)
+        if m:
+            df = _parse_date_token(m.group(1))
+            dt = _parse_date_token(m.group(2))
+            if df and dt:
+                date_from, date_to = df, dt
+
+    # greek: "απο 2/1/26 εως 7/1/26"
+    if not date_from:
+        m = re.search(r"\bαπο\s+(\S+)\s+εως\s+(\S+)", low)
+        if m:
+            df = _parse_date_token(m.group(1))
+            dt = _parse_date_token(m.group(2))
+            if df and dt:
+                date_from, date_to = df, dt
+
+    # fallback: pick first two date tokens anywhere
+    if not date_from:
+        toks = re.findall(r"(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", raw)
+        if len(toks) >= 2:
+            df = _parse_date_token(toks[0])
+            dt = _parse_date_token(toks[1])
+            if df and dt:
+                date_from, date_to = df, dt
+
+    # default if still nothing: current month
+    if not date_from:
+        today = date.today()
+        rng = _month_range(f"{today.year:04d}-{today.month:02d}")
+        date_from, date_to = rng
+
+    return {
+        "entry_type": entry_type,
+        "property_slug": property_slug,
+        "date_from": date_from,
+        "date_to": date_to,
+    }
+
+def handle_report_in_chat(*args, **kwargs):
+    # Returns dict response if message is a report command, else None.
+    # Works even if caller passes args in different order (so you don't get TypeError later).
+    # try kwargs first
+    message = kwargs.get("message") or kwargs.get("text") or kwargs.get("user_message")
+    public_id = kwargs.get("public_id") or kwargs.get("publicId")
+
+    # infer from args
+    str_args = [a for a in args if isinstance(a, str)]
+    if not message:
+        for s in str_args:
+            if any(_norm(s).startswith(p) for p in REPORT_PREFIXES):
+                message = s
+                break
+    if not public_id:
+        # public_id usually looks like a token without spaces
+        for s in str_args:
+            if " " not in (s or "") and len(s) >= 8 and not any(_norm(s).startswith(p) for p in REPORT_PREFIXES):
+                public_id = s
+                break
+
+    req = _parse_report_request(message or "")
+    if not req:
+        return None
+
+    rows = finance_list(
+        limit=50000,
+        property_slug=req["property_slug"],
+        entry_type=req["entry_type"],
+        date_from=req["date_from"],
+        date_to=req["date_to"],
+    )
+
+    total = 0.0
+    by_cat = defaultdict(lambda: {"count": 0, "sum": 0.0})
+
+    for r in rows:
+        try:
+            amt = float(r.get("amount") or 0)
+        except Exception:
+            amt = 0.0
+        total += amt
+        cat = (r.get("category") or "uncategorized").strip() or "uncategorized"
+        by_cat[cat]["count"] += 1
+        by_cat[cat]["sum"] += amt
+
+    top = sorted(by_cat.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+
+    kind = "Κινήσεις"
+    if req["entry_type"] == "expense":
+        kind = "Έξοδα"
+    elif req["entry_type"] == "income":
+        kind = "Έσοδα"
+
+    prop_txt = f" · {req['property_slug']}" if req["property_slug"] else ""
+    reply_lines = [
+        f"{kind} από {req['date_from']} έως {req['date_to']}{prop_txt}",
+        f"Σύνολο: {total:.2f} EUR · Πλήθος: {len(rows)}",
+    ]
+    if top:
+        reply_lines.append("Top κατηγορίες:")
+        for cat, s in top:
+            reply_lines.append(f"- {cat}: {s['sum']:.2f} EUR ({s['count']})")
+
+    params = {}
+    if req["entry_type"]:
+        params["type"] = req["entry_type"]
+    if req["property_slug"]:
+        params["property"] = req["property_slug"]
+    params["from"] = req["date_from"]
+    params["to"] = req["date_to"]
+
+    download_url = f"/p/{public_id}/report.csv?{urlencode(params)}" if public_id else None
+
+    return {
+        "reply": "\n".join(reply_lines),
+        "download_url": download_url,
+    }
+
+</script>
+</body>
+</html>
+"""
 
 @app.post("/p/<public_id>/chat")
 def public_chat(public_id):
@@ -1420,34 +1637,48 @@ def finance_undo_last(public_id):
     if not con:
         return jsonify(error="db_not_configured"), 500
 
-    with con:
-        with con.cursor() as cur:
-            if property_slug:
-                cur.execute("""
-                    SELECT id
-                    FROM finance_entries
-                    WHERE property_slug=%s
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """, (property_slug,))
-            else:
-                cur.execute("""
-                    SELECT id
-                    FROM finance_entries
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                """)
-            row = cur.fetchone()
-            if not row:
-                return jsonify(ok=True, message="Nothing to undo")
+    entry_id = None
+    try:
+        with con:
+            with con.cursor() as cur:
+                if property_slug:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM finance_entries
+                        WHERE property_slug=%s
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """,
+                        (property_slug,)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id
+                        FROM finance_entries
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    )
 
-            entry_id = row[0]
-            cur.execute("DELETE FROM finance_entries WHERE id=%s", (entry_id,))
-            if cur.rowcount == 0:
-                return jsonify(ok=True, message="Nothing to undo")
+                row = cur.fetchone()
+                if not row:
+                    return jsonify(ok=True, message="Nothing to undo")
 
-    con.close()
-    return jsonify(ok=True, undone_id=entry_id, property_slug=property_slug)
+                entry_id = row[0]
+                cur.execute("DELETE FROM finance_entries WHERE id=%s", (entry_id,))
+                if cur.rowcount == 0:
+                    return jsonify(ok=True, message="Nothing to undo")
+
+        return jsonify(ok=True, undone_id=entry_id, property_slug=property_slug)
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+              
 
 
 @app.post("/p/<public_id>/finance/delete")
@@ -1498,20 +1729,23 @@ def finance_recent(public_id):
     with con:
         with con.cursor(cursor_factory=RealDictCursor) as cur:
             if prop:
-                cur.execute("""
-                    SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label
-                    FROM finance_entries
-                    WHERE property_slug=%s
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (prop, limit))
+                cur.execute(
+    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
+    "FROM finance_entries "
+    "WHERE property_slug=%s "
+    "ORDER BY created_at DESC "
+    "LIMIT %s",
+    (prop, limit)
+)
             else:
-                cur.execute("""
-                    SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label
-                    FROM finance_entries
-                    ORDER BY created_at DESC
-                    LIMIT %s
-                """, (limit,))
+                cur.execute(
+    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
+    "FROM finance_entries "
+    "ORDER BY created_at DESC "
+    "LIMIT %s",
+    (limit,)
+)
+
             rows = cur.fetchall()
 
     con.close()
@@ -1577,6 +1811,62 @@ def finance_summary(public_id):
         out[et] = {"count": int(r.get("count") or 0), "total": float(r.get("total") or 0)}
 
     return jsonify(ok=True, filters={"from": date_from, "to": date_to, "property_slug": prop, "type": entry_type}, summary=out)
+@app.get("/p/<public_id>/report.csv")
+def finance_report_csv(public_id):
+    try:
+        a = _get_public_assistant(public_id)
+        if a is None:
+            return jsonify(error="assistant_not_found"), 404
+        if not _assistant_enabled(a):
+            return jsonify(error="assistant_disabled"), 404
+
+        cfg = _assistant_config(a)
+        require_key_if_needed(cfg)
+
+        slug = str(_assistant_id(a) or "")
+        if slug != "finance_clerk":
+            return jsonify(error="not_finance_clerk", slug=slug), 404
+
+        entry_type = (request.args.get("type") or "").strip() or None
+        property_slug = (request.args.get("property") or "").strip() or None
+        date_from = (request.args.get("from") or "").strip() or None
+        date_to = (request.args.get("to") or "").strip() or None
+
+        rows = finance_list(
+            limit=50000,
+            property_slug=property_slug,
+            entry_type=entry_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
+
+        import io, csv
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
+        for r in rows:
+            w.writerow([
+                r.get("entry_date"),
+                r.get("property_slug"),
+                r.get("entry_type"),
+                r.get("amount"),
+                r.get("currency", "EUR"),
+                r.get("category", ""),
+                r.get("label", ""),
+                r.get("id"),
+            ])
+
+        csv_text = "\ufeff" + buf.getvalue()  # BOM for OpenOffice Greek
+        resp = make_response(csv_text)
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = "attachment; filename=finance_report.csv"
+        return resp
+
+    except HTTPException as e:
+        return jsonify(error="unauthorized", detail=str(e)), (e.code or 401)
+    except Exception as e:
+        app.logger.exception("finance_report_csv failed")
+        return jsonify(error="report_failed", detail=str(e)), 500
 
 
 @app.get("/p/<public_id>/export.csv")
@@ -1629,4 +1919,6 @@ def finance_export(public_id):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5050"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=DEBUG_MODE)
+
+
