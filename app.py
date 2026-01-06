@@ -1,4 +1,8 @@
 import os
+import csv
+from io import StringIO
+from urllib.parse import urlencode
+from datetime import timedelta
 import time
 import json
 import re
@@ -182,10 +186,21 @@ def finance_insert(entry: dict):
     con.close()
 
 
-def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, date_to=None):
+def finance_list(
+    limit=50,
+    property_slug=None,
+    entry_type=None,
+    date_from=None,
+    date_to=None,
+    order="DESC",
+):
     con = _finance_conn()
     if not con:
         raise RuntimeError("db_not_configured")
+
+    order = (order or "DESC").upper().strip()
+    if order not in ("ASC", "DESC"):
+        order = "DESC"
 
     where = []
     args = []
@@ -201,8 +216,12 @@ def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, 
     sql = "SELECT * FROM finance_entries"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY entry_date DESC, created_at DESC LIMIT %s"
-    args.append(int(limit))
+
+    sql += f" ORDER BY entry_date {order}, created_at {order}"
+
+    if limit is not None:
+        sql += " LIMIT %s"
+        args.append(int(limit))
 
     with con:
         with con.cursor(cursor_factory=RealDictCursor) as cur:
@@ -813,9 +832,19 @@ PUBLIC_CHAT_HTML = r"""
     });
   }
 
-  async function postChat(message) {
-    const clientId = getOrCreateClientId();
-    const key = requiresKey ? getSavedKey() : "";
+      const botText = data && (data.reply || data.answer || data.message || data.error);
+      appendLog(botText || "(empty)", "bot");
+      if (data && data.download_url) {
+        // auto download report CSV with auth headers
+        setStatus("Downloading report CSV...");
+        await downloadWithAuth(data.download_url, `report_${publicId}`);
+        appendLog("Report CSV downloaded.", "bot");
+      }
+    
+      }
+
+      setStatus("Sent.");
+
 
     if (requiresKey && !key) {
       alert("No finance key saved. Paste it once and hit Save.");
@@ -860,9 +889,55 @@ PUBLIC_CHAT_HTML = r"""
     }
   }
 
-  async function downloadCsv() {
+  async function downloadWithAuth(path, filenamePrefix) {
     const clientId = getOrCreateClientId();
     const key = requiresKey ? getSavedKey() : "";
+
+    if (requiresKey && !key) {
+      alert("No finance key saved. Paste it once and hit Save.");
+      return;
+    }
+
+    try {
+      const resp = await fetch(path, {
+        method: "GET",
+        headers: {
+          ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
+          "X-CLIENT-ID": clientId
+        }
+      });
+
+      if (!resp.ok) {
+        const t = await resp.text();
+        setStatus("Download failed.", true);
+        appendLog("ERROR: " + t, "err");
+        return;
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      const now = new Date();
+      const stamp = now.toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.href = url;
+      a.download = `${filenamePrefix}_${stamp}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+
+      setStatus("Downloaded.");
+    } catch (e) {
+      setStatus("Network error.", true);
+      appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
+    }
+  }
+
+    async function downloadCsv() {
+    setStatus("Downloading CSV...");
+    await downloadWithAuth(`/p/${publicId}/export.csv`, `finance_${publicId}`);
+  }
 
     if (requiresKey && !key) {
       alert("No finance key saved. Paste it once and hit Save.");
@@ -1180,6 +1255,24 @@ def public_chat(public_id):
     rl = rate_limited()
     if rl:
         return rl
+    # 1) Πάρε input από JSON ή form
+    data = request.get_json(silent=True) or {}
+    user_text = (
+        (data.get("message") or data.get("text") or data.get("input") or "")
+        if isinstance(data, dict) else ""
+    ).strip()
+
+    # fallback: αν στέλνεις form-data
+    if not user_text:
+        user_text = (request.form.get("message") or request.form.get("text") or "").strip()
+
+    # 2) Reports: αν είναι report/αναφορά, ΜΗΝ το περνάς σαν καταχώρηση
+    rep = handle_report_in_chat(public_id, user_text)
+    if rep:
+        return jsonify(rep)
+
+    # 3) από εδώ και κάτω συνεχίζεις το υπάρχον flow (insert / llm / categorization)
+
 
     try:
         data = request.get_json(silent=True) or {}
@@ -1509,7 +1602,7 @@ def finance_export(public_id):
 
         import io, csv
         buf = io.StringIO()
-        w = csv.writer(buf)
+        w = csv.writer(buf, lineterminator="\r\n")
         w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
         for r in rows:
             w.writerow([
@@ -1523,7 +1616,7 @@ def finance_export(public_id):
                 r.get("id"),
             ])
 
-        csv_text = buf.getvalue()
+        csv_text = "\ufeff" + buf.getvalue()
         resp = make_response(csv_text)
         resp.headers["Content-Type"] = "text/csv; charset=utf-8"
         resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
