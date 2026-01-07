@@ -1332,6 +1332,18 @@ def public_chat(public_id):
 
         pending = finance_pending_get(public_id, client_id) or {}
         fields = parse_finance_fields(message)
+
+        # --- compatibility mapping (accept old key names) ---
+        if fields.get("entry_type") is None and fields.get("type") is not None:
+            fields["entry_type"] = fields["type"]
+
+        if fields.get("property_slug") is None and fields.get("property") is not None:
+            fields["property_slug"] = fields["property"]
+
+        if fields.get("entry_date") is None and fields.get("date") is not None:
+            fields["entry_date"] = fields["date"]
+        # ---------------------------------------------------
+
         date_in_msg = bool(_DATE_RE.search(message))
 
         if looks_like_new_entry(fields):
@@ -1344,6 +1356,7 @@ def public_chat(public_id):
                 "label": fields.get("label"),
                 "raw_text": fields.get("raw_text") or message.strip(),
             }
+
         else:
             if not pending:
                 return jsonify(reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Πλήρωσα νερό Βουρβουρού 20€” ή “Εισέπραξα Airbnb 300€”.")
