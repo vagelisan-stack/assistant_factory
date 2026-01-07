@@ -1333,6 +1333,24 @@ def public_chat(public_id):
         pending = finance_pending_get(public_id, client_id) or {}
         fields = parse_finance_fields(message)
 
+        # Admin-only debug: see what the server parsed
+        if request.args.get("debug") == "1":
+            expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+            provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
+            if not expected or provided != expected:
+                return jsonify(error="unauthorized"), 401
+
+            return jsonify(
+                ok=True,
+                public_id=public_id,
+                client_id=client_id,
+                message=message,
+                fields=fields,
+                looks_like_new_entry=looks_like_new_entry(fields),
+                pending=pending,
+            ), 200
+
+
         # --- compatibility mapping (accept old key names) ---
         if fields.get("entry_type") is None and fields.get("type") is not None:
             fields["entry_type"] = fields["type"]
