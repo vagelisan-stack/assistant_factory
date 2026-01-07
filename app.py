@@ -54,15 +54,6 @@ if db_store:
 import os
 from flask import jsonify
 
-@app.get("/__boot")
-def __boot():
-    return jsonify(
-        file=__file__,
-        cwd=os.getcwd(),
-        routes=sorted([r.rule for r in app.url_map.iter_rules()])
-    ), 200
-
-
 
 @app.errorhandler(Exception)
 def _handle_any_exception(e):
