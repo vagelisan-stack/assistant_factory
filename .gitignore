@@ -1,26 +1,9 @@
-# secrets
-.env
-.env.*
+# local scratch
+check_quotes.py
+*.csv
+*.bad
+*.bak
+secrets.ps1
 
-# runtime data (DB, assistants on disk, logs, backups)
-data/
-*.db
-backups/
-
-# python
-__pycache__/
-*.pyc
-.venv/
-venv/
-
-req.json
-
-admin_key.txt
-
-finance*.csv
-
-tral_testsassistant_factory
-
-finance_key.txt
-
-body.json
+# ignore whole local fava_guest dump
+/assistants/fava_guest/
