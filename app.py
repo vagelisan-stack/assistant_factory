@@ -1,15 +1,14 @@
 import os
-import csv
-from io import StringIO
-from urllib.parse import urlencode
-from datetime import timedelta
-import time
 import json
 import re
 import uuid
+import time
+import csv
+import calendar
 import unicodedata
-from datetime import date, datetime, timezone
+from io import StringIO
 from pathlib import Path
+from datetime import date, datetime, timezone
 from collections import defaultdict, deque
 from functools import wraps
 
@@ -24,61 +23,180 @@ from assistant_store import AssistantStore
 from llm_client import MistralClient
 from db_store import DBAssistantStore
 
-APP_BUILD = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()[:7] or "dev"
 
-# Load .env ONCE, early
+# ---------------------------
+# Bootstrap
+# ---------------------------
 load_dotenv(override=True)
 
+APP_BUILD = (os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_COMMIT") or "").strip()[:7] or "dev"
 APP_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
-
-# ---------- Paths / Store ----------
 BASE_DIR = Path(__file__).resolve().parent
 ASSISTANTS_DIR = Path(os.getenv("ASSISTANTS_DIR") or (BASE_DIR / "assistants"))
+
 STORE = AssistantStore(base_dir=str(ASSISTANTS_DIR))
 
-# ---------- Flask ----------
 app = Flask(__name__)
-import logging
-from werkzeug.exceptions import HTTPException
-
 DEBUG_MODE = (os.getenv("FLASK_DEBUG") or "").strip().lower() in ("1", "true", "yes", "on")
 
-@app.errorhandler(Exception)
-def _handle_any_exception(e):
-    # Always log full traceback to server console
-    app.logger.exception("Unhandled exception")
-    if isinstance(e, HTTPException):
-        return jsonify(error=e.name, detail=e.description), (e.code or 500)
-
-    # For local debugging only
-    if DEBUG_MODE:
-        return jsonify(
-            error="server_error",
-            type=e.__class__.__name__,
-            detail=str(e),
-        ), 500
-
-    # Production-safe generic error
-    return jsonify(error="server_error"), 500
-
-app.json.ensure_ascii = False
+# Flask JSON utf-8 (guarded for version differences)
+try:
+    app.json.ensure_ascii = False
+except Exception:
+    pass
 
 DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
 db_store = DBAssistantStore(DATABASE_URL) if DATABASE_URL else None
 if db_store:
     db_store.init_db()
 
+import os
+from flask import jsonify
+
+@app.get("/__boot")
+def __boot():
+    return jsonify(
+        file=__file__,
+        cwd=os.getcwd(),
+        routes=sorted([r.rule for r in app.url_map.iter_rules()])
+    ), 200
+
+
+
+@app.errorhandler(Exception)
+def _handle_any_exception(e):
+    app.logger.exception("Unhandled exception")
+    if isinstance(e, HTTPException):
+        return jsonify(error=e.name, detail=e.description), (e.code or 500)
+
+    if DEBUG_MODE:
+        return jsonify(error="server_error", type=e.__class__.__name__, detail=str(e)), 500
+
+    return jsonify(error="server_error"), 500
+
+
 # ---------------------------
-# Finance DB helpers (Postgres)
+# Helpers: assistant records
+# ---------------------------
+def _rec_get(rec, key, default=None):
+    if isinstance(rec, dict):
+        return rec.get(key, default)
+    return getattr(rec, key, default)
+
+
+def _assistant_id(a):
+    if a is None:
+        return None
+    if isinstance(a, dict):
+        return a.get("slug") or a.get("assistant_id") or a.get("id")
+    return getattr(a, "slug", None) or getattr(a, "assistant_id", None) or getattr(a, "id", None)
+
+
+def _assistant_enabled(a) -> bool:
+    return bool(_rec_get(a, "enabled", False))
+
+
+def _assistant_config(a) -> dict:
+    cfg = _rec_get(a, "config", None) or _rec_get(a, "config_json", None) or {}
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except Exception:
+            cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def require_key_if_needed(cfg: dict):
+    cfg = cfg or {}
+    if not (cfg.get("requires_key") or cfg.get("require_key") or cfg.get("finance_requires_key")):
+        return
+
+    expected = (os.getenv("FINANCE_KEY") or "").strip()
+    if not expected:
+        abort(500, description="FINANCE_KEY is not configured")
+
+    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
+    if provided != expected:
+        abort(401, description="unauthorized")
+
+
+def _get_public_assistant(public_id: str):
+    # DB-first
+    if db_store:
+        try:
+            rec = db_store.get_by_public_id(public_id)
+            if rec is not None:
+                return rec
+        except Exception:
+            app.logger.exception("get_by_public_id failed")
+
+    # fallback filesystem (legacy)
+    for a in STORE.list(enabled_only=False):
+        pid = _rec_get(a, "public_id", None)
+        is_pub = bool(_rec_get(a, "is_public", False))
+        if pid == public_id and is_pub:
+            return a
+
+    return None
+
+
+# ---------------------------
+# Admin auth
+# ---------------------------
+def _is_admin(req) -> bool:
+    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
+    provided = (req.headers.get("X-ADMIN-KEY") or "").strip()
+    return bool(expected) and (provided == expected)
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _is_admin(request):
+            return jsonify({"error": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+# ---------------------------
+# Rate limiting (public chat)
+# ---------------------------
+RATE = defaultdict(lambda: deque())
+WINDOW_SECONDS = int(os.getenv("RL_WINDOW_SECONDS", "60"))
+MAX_REQ_PER_WINDOW = int(os.getenv("RL_MAX_REQ", "20"))
+
+
+def get_client_ip() -> str:
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return (request.remote_addr or "unknown").strip()
+
+
+def rate_limited():
+    ip = get_client_ip()
+    now = time.time()
+    q = RATE[ip]
+
+    while q and now - q[0] > WINDOW_SECONDS:
+        q.popleft()
+
+    if len(q) >= MAX_REQ_PER_WINDOW:
+        return jsonify(error="Too many requests, slow down."), 429
+
+    q.append(now)
+    return None
+
+
+# ---------------------------
+# Finance DB (Postgres)
 # ---------------------------
 def _finance_conn():
     dsn = (os.getenv("DATABASE_URL") or "").strip()
     if not dsn:
         return None
 
-    # Render often needs SSL, local usually not.
-    # We'll try SSL first, then fallback.
     try:
         return psycopg2.connect(dsn, sslmode=os.getenv("PGSSLMODE", "require"))
     except Exception:
@@ -91,39 +209,33 @@ def ensure_finance_schema():
         return
     with con:
         with con.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS finance_entries (
-              id TEXT PRIMARY KEY,
-              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              entry_date DATE NOT NULL,
-              property_slug TEXT NOT NULL,
-              entry_type TEXT NOT NULL CHECK (entry_type IN ('expense','income')),
-              amount NUMERIC(12,2) NOT NULL,
-              currency TEXT NOT NULL DEFAULT 'EUR',
-              category TEXT,
-              label TEXT,
-              note TEXT,
-              raw_text TEXT
-            );
-            """)
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS finance_entries ("
+                " id TEXT PRIMARY KEY,"
+                " created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+                " entry_date DATE NOT NULL,"
+                " property_slug TEXT NOT NULL,"
+                " entry_type TEXT NOT NULL CHECK (entry_type IN ('expense','income')),"
+                " amount NUMERIC(12,2) NOT NULL,"
+                " currency TEXT NOT NULL DEFAULT 'EUR',"
+                " category TEXT,"
+                " label TEXT,"
+                " note TEXT,"
+                " raw_text TEXT"
+                ");"
+            )
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_date ON finance_entries(entry_date);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_prop ON finance_entries(property_slug);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_finance_entries_created ON finance_entries(created_at);")
 
-            # merchant memory
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS finance_merchant_map (
-              token TEXT PRIMARY KEY,
-              category TEXT NOT NULL,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """)
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS finance_merchant_map ("
+                " token TEXT PRIMARY KEY,"
+                " category TEXT NOT NULL,"
+                " updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+                ");"
+            )
     con.close()
-
-
-# Ensure finance schema once at startup (if DB configured)
-if DATABASE_URL:
-    ensure_finance_schema()
 
 
 def ensure_finance_pending_schema():
@@ -132,16 +244,21 @@ def ensure_finance_pending_schema():
         return
     with con:
         with con.cursor() as cur:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS finance_pending (
-              public_id TEXT NOT NULL,
-              client_id TEXT NOT NULL,
-              updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-              data TEXT NOT NULL,
-              PRIMARY KEY (public_id, client_id)
-            );
-            """)
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS finance_pending ("
+                " public_id TEXT NOT NULL,"
+                " client_id TEXT NOT NULL,"
+                " updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+                " data TEXT NOT NULL,"
+                " PRIMARY KEY (public_id, client_id)"
+                ");"
+            )
     con.close()
+
+
+if DATABASE_URL:
+    ensure_finance_schema()
+    ensure_finance_pending_schema()
 
 
 def finance_pending_get(public_id: str, client_id: str):
@@ -170,12 +287,13 @@ def finance_pending_upsert(public_id: str, client_id: str, data: dict):
     payload = json.dumps(data, ensure_ascii=False)
     with con:
         with con.cursor() as cur:
-            cur.execute("""
-            INSERT INTO finance_pending (public_id, client_id, data, updated_at)
-            VALUES (%s,%s,%s,NOW())
-            ON CONFLICT (public_id, client_id)
-            DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()
-            """, (public_id, client_id, payload))
+            cur.execute(
+                "INSERT INTO finance_pending (public_id, client_id, data, updated_at)"
+                " VALUES (%s,%s,%s,NOW())"
+                " ON CONFLICT (public_id, client_id)"
+                " DO UPDATE SET data=EXCLUDED.data, updated_at=NOW()",
+                (public_id, client_id, payload),
+            )
     con.close()
 
 
@@ -197,26 +315,20 @@ def finance_insert(entry: dict):
 
     with con:
         with con.cursor() as cur:
-            cur.execute("""
-              INSERT INTO finance_entries
-              (id, entry_date, property_slug, entry_type, amount, currency, category, label, note, raw_text)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                entry["id"], entry["entry_date"], entry["property_slug"], entry["entry_type"],
-                entry["amount"], entry.get("currency", "EUR"),
-                entry.get("category"), entry.get("label"), entry.get("note"), entry.get("raw_text")
-            ))
+            cur.execute(
+                "INSERT INTO finance_entries"
+                " (id, entry_date, property_slug, entry_type, amount, currency, category, label, note, raw_text)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    entry["id"], entry["entry_date"], entry["property_slug"], entry["entry_type"],
+                    entry["amount"], entry.get("currency", "EUR"),
+                    entry.get("category"), entry.get("label"), entry.get("note"), entry.get("raw_text"),
+                ),
+            )
     con.close()
 
 
-def finance_list(
-    limit=50,
-    property_slug=None,
-    entry_type=None,
-    date_from=None,
-    date_to=None,
-    order="DESC",
-):
+def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, date_to=None, order="DESC"):
     con = _finance_conn()
     if not con:
         raise RuntimeError("db_not_configured")
@@ -252,150 +364,42 @@ def finance_list(
             rows = cur.fetchall()
     con.close()
     return rows
-@app.errorhandler(Exception)
-def _json_errors(e):
-    app.logger.exception("Unhandled exception")
-    if isinstance(e, HTTPException):
-        return jsonify(error=e.name, detail=e.description), (e.code or 500)
-
-    # Μη διαρρέεις λεπτομέρειες σε production
-    if (os.getenv("FLASK_DEBUG") or "").strip() in ("1", "true", "True"):
-        return jsonify(error="server_error", detail=str(e)), 500
-    return jsonify(error="server_error"), 500
 
 
-# ---------------------------
-# Assistant helpers
-# ---------------------------
-def _rec_get(rec, key, default=None):
-    if isinstance(rec, dict):
-        return rec.get(key, default)
-    return getattr(rec, key, default)
-
-
-def _assistant_id(a):
-    if a is None:
+def merchant_map_guess_category(text: str):
+    con = _finance_conn()
+    if not con:
         return None
-    if isinstance(a, dict):
-        return a.get("slug") or a.get("assistant_id") or a.get("id")
-    return getattr(a, "slug", None) or getattr(a, "assistant_id", None) or getattr(a, "id", None)
+    tl = _norm(text)
+    with con:
+        with con.cursor() as cur:
+            cur.execute("SELECT token, category FROM finance_merchant_map")
+            rows = cur.fetchall()
+    con.close()
 
-
-def _assistant_enabled(a) -> bool:
-    return bool(_rec_get(a, "enabled", False))
-
-
-def _assistant_config(a) -> dict:
-    cfg = _rec_get(a, "config", None) or _rec_get(a, "config_json", None) or {}
-    if isinstance(cfg, str):
-        try:
-            cfg = json.loads(cfg)
-        except Exception:
-            cfg = {}
-    return cfg if isinstance(cfg, dict) else {}
-
-
-def require_key_if_needed(cfg: dict):
-    cfg = cfg or {}
-    if not cfg.get("requires_key"):
-        return
-
-    expected = (os.getenv("FINANCE_KEY") or "").strip()
-    if not expected:
-        abort(500, description="FINANCE_KEY is not configured")
-
-    provided = (request.args.get("k") or request.headers.get("X-FINANCE-KEY") or "").strip()
-    if provided != expected:
-        abort(401)
-
-
-def _get_public_assistant(public_id: str):
-    # DB-first
-    if db_store:
-        try:
-            rec = db_store.get_by_public_id(public_id)
-            if rec is not None:
-                return rec
-        except Exception:
-            app.logger.exception("get_by_public_id failed")
-
-    # Fallback: scan filesystem store (legacy mode)
-    for a in STORE.list(enabled_only=False):
-        pid = _rec_get(a, "public_id", None)
-        is_pub = bool(_rec_get(a, "is_public", False))
-        if pid == public_id and is_pub:
-            return a
-
+    for token, cat in rows:
+        if _norm(token) in tl:
+            return cat
     return None
 
 
 # ---------------------------
-# Admin auth
+# Finance parsing (Greek friendly)
 # ---------------------------
-def _is_admin(req) -> bool:
-    expected = (os.getenv("ADMIN_API_KEY") or "").strip()
-    provided = (req.headers.get("X-ADMIN-KEY") or "").strip()
-    return bool(expected) and (provided == expected)
+def _strip_accents(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
 
 
-def admin_required(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        if not _is_admin(request):
-            return jsonify({"error": "unauthorized"}), 401
-        return fn(*args, **kwargs)
-    return wrapper
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = _strip_accents(s)
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
-# ---------------------------
-# Rate limiting for public chat
-# ---------------------------
-RATE = defaultdict(lambda: deque())
-WINDOW_SECONDS = int(os.getenv("RL_WINDOW_SECONDS", "60"))
-MAX_REQ_PER_WINDOW = int(os.getenv("RL_MAX_REQ", "20"))
-
-
-def get_client_ip() -> str:
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-    if xff:
-        return xff.split(",")[0].strip()
-    return (request.remote_addr or "unknown").strip()
-
-
-def rate_limited():
-    ip = get_client_ip()
-    now = time.time()
-    q = RATE[ip]
-
-    while q and now - q[0] > WINDOW_SECONDS:
-        q.popleft()
-
-    if len(q) >= MAX_REQ_PER_WINDOW:
-        return jsonify(error="Too many requests, slow down."), 429
-
-    q.append(now)
-    return None
-
-
-# ---------------------------
-# Finance parsing (Greek-friendly)
-# ---------------------------
-_EXPENSE_WORDS = [
-    "πλήρωσα", "πληρωσα",
-    "εδωσα", "έδωσα",
-    "αγόρασα", "αγορασα",
-    "ψώνισα", "ψωνισα",
-    "χρεώθηκα", "χρεωθηκα",
-    "έξοδο", "εξοδο", "expense",
-]
-_INCOME_WORDS  = [
-    "εισέπραξα", "εισπραξα",
-    "πήρα", "πηρα",
-    "πληρώθηκα", "πληρωθηκα",
-    "έλαβα", "ελαβα",
-    "μπήκαν", "μπηκαν",
-    "έσοδο", "εσοδο", "income",
-]
+_EXPENSE_WORDS = ["πληρωσα", "εδωσα", "αγορασα", "ψωνισα", "χρεωθηκα", "εξοδο", "expense"]
+_INCOME_WORDS  = ["εισπραξα", "πηρα", "πληρωθηκα", "ελαβα", "μπηκαν", "εσοδο", "income"]
 
 _PROP_MAP = {
     "thessaloniki": ["θεσσαλονικη", "θεσ", "thessaloniki"],
@@ -403,27 +407,20 @@ _PROP_MAP = {
 }
 
 _CAT_RULES = [
-    ("utilities", ["δεη","ρεύμα","ρευμα","νερό","νερο","ιντερνετ","internet","κοινόχρηστα","κοινοχρηστα"]),
+    ("utilities", ["δεη","ρευμα","νερο","ιντερνετ","internet","κοινοχρηστα"]),
     ("home_maintenance", ["συντηρ","επισκευ","υδραυλ","ηλεκτρολογ","κηπ","garden","service","repair"]),
-    ("groceries", [
-        "σουπερ", "μάρκετ", "μαρκετ", "τροφ", "supermarket",
-        "super market", "mini market", "minimarket",
-        "souper", "supper", "super mart"
-    ]),
-    ("transport", ["parking","παρκινγκ","διόδια","διοδια","βενζιν","fuel","diesel","κτεο","service αυτοκιν","αντιπροσωπ","ασφαλεια αυτοκιν"]),
-    ("dining", ["εστιατ","restaurant","ταβερν","taverna","φαγητο","γεύμα"]),
+    ("groceries", ["σουπερ","μαρκετ","τροφ","supermarket","mini market","minimarket","super market"]),
+    ("transport", ["parking","παρκινγκ","διοδια","βενζιν","fuel","diesel","service αυτοκιν","ασφαλεια αυτοκιν"]),
+    ("dining", ["εστιατ","restaurant","ταβερν","taverna","φαγητο","γευμα"]),
     ("bars_coffee", ["καφε","coffee","μπαρ","bar","ποτο","drink","cocktail"]),
-    ("rental_income", ["airbnb","booking","ενοίκ","ενοικ","βραχυχρόν","βραχυχρον"]),
+    ("rental_income", ["airbnb","booking","ενοικ","βραχυχρον"]),
 ]
 
 _DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
-_EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρώ)?", re.IGNORECASE)
+_EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρω)?", re.IGNORECASE)
+_NUM_ONLY_RE = re.compile(r"^\s*\d+(?:[.,]\d{1,2})?\s*$")
 
-
-def _norm(s: str) -> str:
-    s = (s or "").casefold()
-    s = unicodedata.normalize("NFD", s)
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")  # strip accents
+_LABEL_NOISE = {"θεσσαλονικη","thessaloniki","βουρβουρου","vourvourou","πληρωσα","εισπραξα","εξοδο","εσοδο"}
 
 
 def _detect_property(t: str):
@@ -437,36 +434,11 @@ def _detect_property(t: str):
 
 def _detect_type(t: str):
     tl = _norm(t)
-    if any(_norm(w) in tl for w in _INCOME_WORDS):
+    if any(w in tl for w in _INCOME_WORDS):
         return "income"
-    if any(_norm(w) in tl for w in _EXPENSE_WORDS):
+    if any(w in tl for w in _EXPENSE_WORDS):
         return "expense"
     return None
-
-
-_LABEL_NOISE = {
-    "θεσσαλονικη","thessaloniki",
-    "βουρβουρου","vourvourou",
-    "πληρωσα","πλήρωσα",
-    "εισπραξα","εισέπραξα",
-    "εξοδο","έξοδο","εσοδο","έσοδο",
-}
-
-_NUM_ONLY_RE = re.compile(r"^\s*\d+(?:[.,]\d{1,2})?\s*$")
-
-def _label_candidate(text: str):
-    t = (text or "").strip()
-    if not t:
-        return None
-    tl = _norm(t)
-    if tl in _LABEL_NOISE:
-        return None
-    if _NUM_ONLY_RE.match(t):
-        return None
-    # Αν είναι απλά μια λέξη τύπου “Θεσσαλονίκη” μην την κάνεις label
-    if len(t.split()) == 1 and tl in _PROP_MAP.get("thessaloniki", []) + _PROP_MAP.get("vourvourou", []):
-        return None
-    return t
 
 
 def _detect_date(t: str):
@@ -480,8 +452,7 @@ def _detect_date(t: str):
 
 
 def _detect_amount(t: str):
-    # ignore date parts so we don't parse 05/01/2026 as 05 €
-    tmp = _DATE_RE.sub(" ", t)
+    tmp = _DATE_RE.sub(" ", t)  # μην “πιάνει” ημερομηνία ως ποσό
     candidates = [m.group(1) for m in _EUR_AMOUNT_RE.finditer(tmp)]
     if not candidates:
         return None
@@ -498,6 +469,18 @@ def _detect_category(t: str):
         if any(_norm(k) in tl for k in keys):
             return cat
     return "uncategorized"
+
+
+def _label_candidate(text: str):
+    t = (text or "").strip()
+    if not t:
+        return None
+    tl = _norm(t)
+    if tl in _LABEL_NOISE:
+        return None
+    if _NUM_ONLY_RE.match(t):
+        return None
+    return t
 
 
 def parse_finance_fields(text: str) -> dict:
@@ -530,48 +513,25 @@ def looks_like_new_entry(fields: dict) -> bool:
     return has_amount and (has_prop or has_type)
 
 
-def merchant_map_set(token: str, category: str):
-    con = _finance_conn()
-    if not con:
-        raise RuntimeError("db_not_configured")
-    token = (token or "").strip()
-    category = (category or "").strip()
-    with con:
-        with con.cursor() as cur:
-            cur.execute("""
-              INSERT INTO finance_merchant_map(token, category, updated_at)
-              VALUES (%s, %s, NOW())
-              ON CONFLICT(token)
-              DO UPDATE SET category=EXCLUDED.category, updated_at=NOW()
-            """, (token, category))
-    con.close()
-
-
-def merchant_map_guess_category(text: str):
-    """Very simple: if any stored token appears in text, return its category."""
-    con = _finance_conn()
-    if not con:
-        return None
-    tl = _norm(text)
-    with con:
-        with con.cursor() as cur:
-            cur.execute("SELECT token, category FROM finance_merchant_map")
-            rows = cur.fetchall()
-    con.close()
-
-    for token, cat in rows:
-        if _norm(token) in tl:
-            return cat
-    return None
+def _ask_next_missing(missing: list) -> str:
+    if not missing:
+        return ""
+    m = missing[0]
+    if m == "amount":
+        return "Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€)."
+    if m == "property":
+        return "Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;"
+    if m == "type":
+        return "Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”)."
+    return "Λείπουν στοιχεία. Συνέχισε με ποσό/ακίνητο/τύπο."
 
 
 def _is_greeting(msg: str) -> bool:
     t = _norm(msg)
-    return t in ("γεια", "γεια σου", "καλημερα", "καλημέρα", "καλησπερα", "καληνυχτα", "hello", "hi")
+    return t in ("γεια", "γεια σου", "καλημερα", "καλησπερα", "καληνυχτα", "hello", "hi")
 
 
 def _get_client_id_for_state(public_id: str) -> str:
-    # UI already sends X-CLIENT-ID. If missing, fallback to IP.
     return (request.headers.get("X-CLIENT-ID") or "").strip() or get_client_ip()
 
 
@@ -595,80 +555,168 @@ def _finance_auth_and_get_clerk(public_id: str):
     return a, None
 
 
-@app.after_request
-def force_utf8(resp):
-    if resp.mimetype == "application/json":
-        resp.headers["Content-Type"] = "application/json; charset=utf-8"
-    return resp
-
-
 # ---------------------------
-# Bootstrap: import assistants from filesystem if DB empty
+# Reports (chat-triggered)
 # ---------------------------
-def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+REPORT_PREFIXES = ("report", "αναφορα", "αναφορά", "δωσε μου", "δώσε μου", "πες μου", "show me", "give me")
 
 
-def _read_json(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _parse_date_token(tok: str):
+    tok = (tok or "").strip()
+    if not tok:
+        return None
 
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok):
+        return tok
 
-def bootstrap_db_from_filesystem() -> None:
-    if not db_store:
-        return
-
-    try:
-        existing = db_store.list_admin()
-    except Exception:
-        return
-
-    if existing:
-        return
-
-    base = str(ASSISTANTS_DIR)
-    if not os.path.isdir(base):
-        return
-
-    for slug in os.listdir(base):
-        folder = os.path.join(base, slug)
-        if not os.path.isdir(folder):
-            continue
-
-        cfg_path = os.path.join(folder, "config.json")
-        prompt_path = os.path.join(folder, "prompt.md")
-        know_path = os.path.join(folder, "knowledge.md")
-
-        if not (os.path.isfile(cfg_path) and os.path.isfile(prompt_path) and os.path.isfile(know_path)):
-            continue
-
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", tok)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
+        if y < 100:
+            y += 2000
         try:
-            config = _read_json(cfg_path)
-            prompt = _read_text(prompt_path)
-            knowledge = _read_text(know_path)
-            name = (config.get("name") or config.get("title") or slug)
-
-            db_store.create_assistant(
-                slug=slug,
-                name=name,
-                config=config,
-                prompt=prompt,
-                knowledge=knowledge,
-                created_by="bootstrap",
-            )
+            return date(y, mo, d).isoformat()
         except Exception:
-            continue
+            return None
+
+    return None
 
 
-bootstrap_db_from_filesystem()
+def _month_range(ym: str):
+    if not re.fullmatch(r"\d{4}-\d{2}", ym or ""):
+        return None
+    y = int(ym[:4]); m = int(ym[5:7])
+    last = calendar.monthrange(y, m)[1]
+    return (date(y, m, 1).isoformat(), date(y, m, last).isoformat())
+
+
+def _detect_report_entry_type(msg: str):
+    m = _norm(msg)
+    if "εξοδ" in m or re.search(r"\bexpense(s)?\b", m):
+        return "expense"
+    if "εσοδ" in m or re.search(r"\bincome\b", m):
+        return "income"
+    return None
+
+
+def _detect_report_property(msg: str):
+    m = _norm(msg)
+    if "θεσσαλονικη" in m or "thessaloniki" in m:
+        return "thessaloniki"
+    if "βουρβουρου" in m or "vourvourou" in m or "φαβα" in m:
+        return "vourvourou"
+    return None
+
+
+def _parse_report_request(message: str):
+    raw = (message or "").strip()
+    if not raw:
+        return None
+    low = _norm(raw)
+
+    is_report = any(low.startswith(p) for p in REPORT_PREFIXES) or ("εξοδ" in low) or ("εσοδ" in low)
+    if not is_report:
+        return None
+
+    entry_type = _detect_report_entry_type(raw)
+    property_slug = _detect_report_property(raw)
+
+    date_from = None
+    date_to = None
+
+    # μήνας (τρέχων ή με YYYY-MM)
+    if ("μηνα" in low) or ("μήνα" in (message or "")) or ("month" in low):
+        m = re.search(r"\b(\d{4}-\d{2})\b", low)
+        if m:
+            rng = _month_range(m.group(1))
+        else:
+            today = date.today()
+            rng = _month_range(f"{today.year:04d}-{today.month:02d}")
+        if rng:
+            date_from, date_to = rng
+
+    # "απο X εως Y"
+    if not date_from:
+        m = re.search(r"\bαπο\s+(\S+)\s+εως\s+(\S+)", low)
+        if m:
+            df = _parse_date_token(m.group(1))
+            dt = _parse_date_token(m.group(2))
+            if df and dt:
+                date_from, date_to = df, dt
+
+    # fallback: current month
+    if not date_from:
+        today = date.today()
+        rng = _month_range(f"{today.year:04d}-{today.month:02d}")
+        date_from, date_to = rng
+
+    return {"entry_type": entry_type, "property_slug": property_slug, "date_from": date_from, "date_to": date_to}
+
+
+def handle_report_in_chat(public_id: str, message: str):
+    req = _parse_report_request(message)
+    if not req:
+        return None
+
+    rows = finance_list(
+        limit=50000,
+        property_slug=req["property_slug"],
+        entry_type=req["entry_type"],
+        date_from=req["date_from"],
+        date_to=req["date_to"],
+    )
+
+    total = 0.0
+    by_cat = defaultdict(lambda: {"count": 0, "sum": 0.0})
+
+    for r in rows:
+        try:
+            amt = float(r.get("amount") or 0)
+        except Exception:
+            amt = 0.0
+        total += amt
+        cat = (r.get("category") or "uncategorized").strip() or "uncategorized"
+        by_cat[cat]["count"] += 1
+        by_cat[cat]["sum"] += amt
+
+    top = sorted(by_cat.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
+
+    kind = "Κινήσεις"
+    if req["entry_type"] == "expense":
+        kind = "Έξοδα"
+    elif req["entry_type"] == "income":
+        kind = "Έσοδα"
+
+    prop_txt = f" · {req['property_slug']}" if req["property_slug"] else ""
+    reply_lines = [
+        f"{kind} από {req['date_from']} έως {req['date_to']}{prop_txt}",
+        f"Σύνολο: {total:.2f} EUR · Πλήθος: {len(rows)}",
+    ]
+    if top:
+        reply_lines.append("Top κατηγορίες:")
+        for cat, s in top:
+            reply_lines.append(f"- {cat}: {s['sum']:.2f} EUR ({s['count']})")
+
+    params = {}
+    if req["entry_type"]:
+        params["type"] = req["entry_type"]
+    if req["property_slug"]:
+        params["property"] = req["property_slug"]
+    params["from"] = req["date_from"]
+    params["to"] = req["date_to"]
+
+    qs = "&".join([f"{k}={v}" for k, v in params.items()])
+    download_url = f"/p/{public_id}/report.csv?{qs}"
+
+    return {"reply": "\n".join(reply_lines), "download_url": download_url}
 
 
 # ---------------------------
-# Public page HTML
+# Public UI (HTML)
 # ---------------------------
-PUBLIC_CHAT_HTML = r"""
-<!doctype html>
+PUBLIC_CHAT_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
@@ -825,7 +873,7 @@ PUBLIC_CHAT_HTML = r"""
     elKeyStatus.className = has ? "pill ok" : "pill err";
   }
 
-  // Migration helper: if URL has ?k=..., save it once then remove from URL
+  // Save ?k= once then remove
   try {
     const url = new URL(window.location.href);
     const k = (url.searchParams.get("k") || "").trim();
@@ -868,10 +916,7 @@ PUBLIC_CHAT_HTML = r"""
   async function downloadWithAuth(path, filenamePrefix) {
     const clientId = getOrCreateClientId();
     const key = requiresKey ? getSavedKey() : "";
-
-    if (requiresKey && !key) {
-      throw new Error("No finance key saved.");
-    }
+    if (requiresKey && !key) throw new Error("No finance key saved.");
 
     const resp = await fetch(path, {
       method: "GET",
@@ -930,7 +975,9 @@ PUBLIC_CHAT_HTML = r"""
       appendLog(message, "user");
 
       if (!resp.ok) {
-        const errMsg = (data && (data.error || data.message || data.detail)) ? (data.error || data.message || data.detail) : text;
+        const errMsg = (data && (data.error || data.message || data.detail))
+          ? (data.error || data.message || data.detail)
+          : text;
         setStatus("Error.", true);
         appendLog("ERROR: " + errMsg, "err");
         return;
@@ -939,7 +986,6 @@ PUBLIC_CHAT_HTML = r"""
       const botText = data && (data.reply || data.answer || data.message || data.error);
       appendLog(botText || "(empty)", "bot");
 
-      // Auto-download report CSV if backend provided a download_url
       if (data && data.download_url) {
         try {
           setStatus("Downloading report CSV...");
@@ -994,6 +1040,7 @@ PUBLIC_CHAT_HTML = r"""
         },
         body: JSON.stringify({ confirm: true, property_slug: prop || null })
       });
+
       const text = await resp.text();
       let data = null;
       try { data = JSON.parse(text); } catch (e) {}
@@ -1032,6 +1079,7 @@ PUBLIC_CHAT_HTML = r"""
         },
         body: JSON.stringify({ confirm: true, id })
       });
+
       const text = await resp.text();
       let data = null;
       try { data = JSON.parse(text); } catch (e) {}
@@ -1057,7 +1105,6 @@ PUBLIC_CHAT_HTML = r"""
     postChat(m);
   });
 
-  // Enter to send, Shift+Enter for newline
   elMsg.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) {
       ev.preventDefault();
@@ -1075,6 +1122,54 @@ PUBLIC_CHAT_HTML = r"""
 })();
 </script>
 
+</body>
+</html>
+"""
+
+
+@app.after_request
+def force_utf8(resp):
+    if resp.mimetype == "application/json":
+        resp.headers["Content-Type"] = "application/json; charset=utf-8"
+    return resp
+
+
+# ---------------------------
+# LLM runner
+# ---------------------------
+def _run_assistant(rec, message: str) -> str:
+    cfg = _assistant_config(rec)
+
+    prompt = (_rec_get(rec, "prompt", "") or "").strip()
+    knowledge = (_rec_get(rec, "knowledge", "") or "").strip()
+
+    system = prompt
+    if knowledge:
+        system = (system + "\n\n" if system else "") + "### Knowledge\n" + knowledge
+    if not system:
+        system = "You are a helpful assistant."
+
+    model = cfg.get("model") or _rec_get(rec, "model", None) or "mistral-large-latest"
+    temperature = cfg.get("temperature", _rec_get(rec, "temperature", 0.2))
+    max_tokens = cfg.get("max_tokens", _rec_get(rec, "max_tokens", 600))
+
+    try:
+        temperature = float(temperature)
+    except Exception:
+        temperature = 0.2
+    try:
+        max_tokens = int(max_tokens)
+    except Exception:
+        max_tokens = 600
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": message},
+    ]
+
+    client = MistralClient()
+    return client.chat(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+
 
 # ---------------------------
 # Routes
@@ -1083,13 +1178,13 @@ PUBLIC_CHAT_HTML = r"""
 def health():
     assistants = STORE.list(enabled_only=False)
     return jsonify(
-    ok=True,
-    build=APP_BUILD,
-    started_at=APP_STARTED_AT,
-    assistants_dir=str(ASSISTANTS_DIR),
-    assistants_count=len(assistants),
-    db_enabled=bool(db_store),
-)
+        ok=True,
+        build=APP_BUILD,
+        started_at=APP_STARTED_AT,
+        assistants_dir=str(ASSISTANTS_DIR),
+        assistants_count=len(assistants),
+        db_enabled=bool(db_store),
+    )
 
 
 @app.post("/admin/reset_finance")
@@ -1174,447 +1269,144 @@ def admin_rotate_public_id(assistant_id: str):
         return jsonify({"error": "rotate_failed", "type": type(e).__name__, "detail": str(e)}), 500
 
 
+# Serve UI at /p/<public_id> and also /p/<public_id>/chat (GET)
 @app.get("/p/<public_id>")
+@app.get("/p/<public_id>/")
+@app.get("/p/<public_id>/chat")
 def public_page(public_id):
     a = _get_public_assistant(public_id)
     if a is None or not _assistant_enabled(a):
-        abort(404)
+        return jsonify(error="Unknown/disabled public assistant"), 404
+
+    cfg = _assistant_config(a)
+    slug = str(_assistant_id(a) or "")
+    title = cfg.get("title") or cfg.get("name") or "Assistant"
+
+    requires_key = bool(cfg.get("requires_key") or cfg.get("require_key") or cfg.get("finance_requires_key"))
 
     resp = make_response(render_template_string(
         PUBLIC_CHAT_HTML,
         public_id=public_id,
-        title="Finance Clerk",
-        assistant_slug="finance_clerk",
-        requires_key=bool(_assistant_config(a).get("requires_key"))
+        assistant_slug=slug,
+        requires_key=requires_key,
+        title=title,
     ))
-
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     resp.headers["Pragma"] = "no-cache"
     resp.headers["Expires"] = "0"
     return resp
 
 
-def _run_assistant(rec, message: str) -> str:
-    cfg = _assistant_config(rec)
-
-    prompt = (_rec_get(rec, "prompt", "") or "").strip()
-    knowledge = (_rec_get(rec, "knowledge", "") or "").strip()
-
-    system = prompt
-    if knowledge:
-        system = (system + "\n\n" if system else "") + "### Knowledge\n" + knowledge
-    if not system:
-        system = "You are a helpful assistant."
-
-    model = cfg.get("model") or _rec_get(rec, "model", None) or "mistral-large-latest"
-    temperature = cfg.get("temperature", _rec_get(rec, "temperature", 0.2))
-    max_tokens = cfg.get("max_tokens", _rec_get(rec, "max_tokens", 600))
-
-    try:
-        temperature = float(temperature)
-    except Exception:
-        temperature = 0.2
-    try:
-        max_tokens = int(max_tokens)
-    except Exception:
-        max_tokens = 600
-
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": message},
-    ]
-
-    client = MistralClient()
-    return client.chat(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
-
-
-def _ask_next_missing(missing: list) -> str:
-    if not missing:
-        return ""
-    m = missing[0]
-    if m == "amount":
-        return "Λείπει το ποσό. Πες μου πόσο ήταν (π.χ. 35€)."
-    if m == "property":
-        return "Λείπει το ακίνητο. Είναι Θεσσαλονίκη ή Βουρβουρού;"
-    if m == "type":
-        return "Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”)."
-    return "Λείπουν στοιχεία. Συνέχισε με ποσό/ακίνητο/τύπο."
-import calendar
-from urllib.parse import urlencode
-
-REPORT_PREFIXES = ("report", "αναφορά", "αναφορα")
-
-def _strip_accents(s: str) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
-    return s
-
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = _strip_accents(s)
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-_PROPERTY_ALIASES = {
-    "thessaloniki": "thessaloniki",
-    "thessaloniki ": "thessaloniki",
-    "θεσσαλονικη": "thessaloniki",
-    "vourvourou": "vourvourou",
-    "βουρβουρου": "vourvourou",
-}
-
-def _detect_property_slug(msg: str) -> str | None:
-    m = _norm(msg)
-    for k, v in _PROPERTY_ALIASES.items():
-        if k in m:
-            return v
-    # last resort: accept slugs if user typed them
-    for slug in ("thessaloniki", "vourvourou"):
-        if re.search(rf"\b{slug}\b", m):
-            return slug
-    return None
-
-def _detect_entry_type(msg: str) -> str | None:
-    m = _norm(msg)
-    if re.search(r"\b(expense|expenses)\b", m) or "εξοδ" in m:
-        return "expense"
-    if re.search(r"\b(income)\b", m) or "εσοδ" in m:
-        return "income"
-    return None
-
-def _parse_date_token(tok: str) -> str | None:
-    tok = (tok or "").strip()
-    if not tok:
-        return None
-
-    # YYYY-MM-DD
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok):
-        return tok
-
-    # D/M/YY or D/M/YYYY
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", tok)
-    if m:
-        d = int(m.group(1))
-        mo = int(m.group(2))
-        y = int(m.group(3))
-        if y < 100:
-            y += 2000
-        try:
-            return date(y, mo, d).isoformat()
-        except Exception:
-            return None
-
-    return None
-
-def _month_range(ym: str) -> tuple[str, str] | None:
-    # ym: YYYY-MM
-    if not re.fullmatch(r"\d{4}-\d{2}", ym or ""):
-        return None
-    y = int(ym[:4]); m = int(ym[5:7])
-    last = calendar.monthrange(y, m)[1]
-    return (date(y, m, 1).isoformat(), date(y, m, last).isoformat())
-
-def _parse_report_request(message: str) -> dict | None:
-    raw = (message or "").strip()
-    if not raw:
-        return None
-
-    low = _norm(raw)
-    if not any(low.startswith(p) for p in REPORT_PREFIXES):
-        return None
-
-    entry_type = _detect_entry_type(raw)
-    property_slug = _detect_property_slug(raw)
-
-    # date range detection
-    date_from = None
-    date_to = None
-
-    # month commands: "report month" / "αναφορά μήνα" + optional YYYY-MM
-    if (" month" in low) or (" μηνα" in low) or (" μηνας" in low) or low.startswith("report month") or low.startswith("αναφορα μηνα") or low.startswith("αναφορα μηνας"):
-        m = re.search(r"\b(\d{4}-\d{2})\b", low)
-        if m:
-            rng = _month_range(m.group(1))
-        else:
-            today = date.today()
-            rng = _month_range(f"{today.year:04d}-{today.month:02d}")
-        if rng:
-            date_from, date_to = rng
-
-    # range commands: "report range 2026-01-02 2026-01-07"
-    if not date_from:
-        m = re.search(r"\brange\s+(\S+)\s+(\S+)", low)
-        if m:
-            df = _parse_date_token(m.group(1))
-            dt = _parse_date_token(m.group(2))
-            if df and dt:
-                date_from, date_to = df, dt
-
-    # greek: "απο 2/1/26 εως 7/1/26"
-    if not date_from:
-        m = re.search(r"\bαπο\s+(\S+)\s+εως\s+(\S+)", low)
-        if m:
-            df = _parse_date_token(m.group(1))
-            dt = _parse_date_token(m.group(2))
-            if df and dt:
-                date_from, date_to = df, dt
-
-    # fallback: pick first two date tokens anywhere
-    if not date_from:
-        toks = re.findall(r"(\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})", raw)
-        if len(toks) >= 2:
-            df = _parse_date_token(toks[0])
-            dt = _parse_date_token(toks[1])
-            if df and dt:
-                date_from, date_to = df, dt
-
-    # default if still nothing: current month
-    if not date_from:
-        today = date.today()
-        rng = _month_range(f"{today.year:04d}-{today.month:02d}")
-        date_from, date_to = rng
-
-    return {
-        "entry_type": entry_type,
-        "property_slug": property_slug,
-        "date_from": date_from,
-        "date_to": date_to,
-    }
-
-def handle_report_in_chat(*args, **kwargs):
-    # Returns dict response if message is a report command, else None.
-    # Works even if caller passes args in different order (so you don't get TypeError later).
-    # try kwargs first
-    message = kwargs.get("message") or kwargs.get("text") or kwargs.get("user_message")
-    public_id = kwargs.get("public_id") or kwargs.get("publicId")
-
-    # infer from args
-    str_args = [a for a in args if isinstance(a, str)]
-    if not message:
-        for s in str_args:
-            if any(_norm(s).startswith(p) for p in REPORT_PREFIXES):
-                message = s
-                break
-    if not public_id:
-        # public_id usually looks like a token without spaces
-        for s in str_args:
-            if " " not in (s or "") and len(s) >= 8 and not any(_norm(s).startswith(p) for p in REPORT_PREFIXES):
-                public_id = s
-                break
-
-    req = _parse_report_request(message or "")
-    if not req:
-        return None
-
-    rows = finance_list(
-        limit=50000,
-        property_slug=req["property_slug"],
-        entry_type=req["entry_type"],
-        date_from=req["date_from"],
-        date_to=req["date_to"],
-    )
-
-    total = 0.0
-    by_cat = defaultdict(lambda: {"count": 0, "sum": 0.0})
-
-    for r in rows:
-        try:
-            amt = float(r.get("amount") or 0)
-        except Exception:
-            amt = 0.0
-        total += amt
-        cat = (r.get("category") or "uncategorized").strip() or "uncategorized"
-        by_cat[cat]["count"] += 1
-        by_cat[cat]["sum"] += amt
-
-    top = sorted(by_cat.items(), key=lambda kv: kv[1]["sum"], reverse=True)[:5]
-
-    kind = "Κινήσεις"
-    if req["entry_type"] == "expense":
-        kind = "Έξοδα"
-    elif req["entry_type"] == "income":
-        kind = "Έσοδα"
-
-    prop_txt = f" · {req['property_slug']}" if req["property_slug"] else ""
-    reply_lines = [
-        f"{kind} από {req['date_from']} έως {req['date_to']}{prop_txt}",
-        f"Σύνολο: {total:.2f} EUR · Πλήθος: {len(rows)}",
-    ]
-    if top:
-        reply_lines.append("Top κατηγορίες:")
-        for cat, s in top:
-            reply_lines.append(f"- {cat}: {s['sum']:.2f} EUR ({s['count']})")
-
-    params = {}
-    if req["entry_type"]:
-        params["type"] = req["entry_type"]
-    if req["property_slug"]:
-        params["property"] = req["property_slug"]
-    params["from"] = req["date_from"]
-    params["to"] = req["date_to"]
-
-    download_url = f"/p/{public_id}/report.csv?{urlencode(params)}" if public_id else None
-
-    return {
-        "reply": "\n".join(reply_lines),
-        "download_url": download_url,
-    }
-
-</script>
-</body>
-</html>
-"""
-
 @app.post("/p/<public_id>/chat")
 def public_chat(public_id):
     rl = rate_limited()
     if rl:
         return rl
-    # 1) Πάρε input από JSON ή form
+
     data = request.get_json(silent=True) or {}
-    user_text = (
-        (data.get("message") or data.get("text") or data.get("input") or "")
-        if isinstance(data, dict) else ""
-    ).strip()
+    assistant_id = (data.get("assistant_id") or "").strip()
+    message = (data.get("message") or data.get("text") or data.get("input") or "").strip()
 
-    # fallback: αν στέλνεις form-data
-    if not user_text:
-        user_text = (request.form.get("message") or request.form.get("text") or "").strip()
+    if not assistant_id:
+        return jsonify(error="Missing assistant_id"), 400
+    if not message:
+        return jsonify(error="Missing message"), 400
 
-    # 2) Reports: αν είναι report/αναφορά, ΜΗΝ το περνάς σαν καταχώρηση
-    rep = handle_report_in_chat(public_id, user_text)
-    if rep:
-        return jsonify(rep)
+    a = _get_public_assistant(public_id)
+    if a is None or not _assistant_enabled(a):
+        return jsonify(error="Unknown/disabled public assistant"), 404
 
-    # 3) από εδώ και κάτω συνεχίζεις το υπάρχον flow (insert / llm / categorization)
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
 
+    slug = str(_assistant_id(a) or "")
+    if assistant_id != slug:
+        return jsonify(error="assistant_id does not match public_id", expected=slug, provided=assistant_id), 400
 
-    try:
-        data = request.get_json(silent=True) or {}
-        assistant_id = (data.get("assistant_id") or "").strip()
-        message = (data.get("message") or "").strip()
+    # finance_clerk wizard + reports
+    if slug == "finance_clerk":
+        rep = handle_report_in_chat(public_id, message)
+        if rep:
+            return jsonify(rep)
 
-        if not assistant_id:
-            return jsonify(error="Missing assistant_id"), 400
-        if not message:
-            return jsonify(error="Missing message"), 400
+        if _is_greeting(message):
+            return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα μήνα”.")
 
-        a = _get_public_assistant(public_id)
-        if a is None or not _assistant_enabled(a):
-            return jsonify(error="Unknown/disabled public assistant"), 404
+        client_id = _get_client_id_for_state(public_id)
+        norm_msg = _norm(message)
 
-        cfg = _assistant_config(a)
-        require_key_if_needed(cfg)
-
-        slug = str(_assistant_id(a) or "")
-        if assistant_id != slug:
-            return jsonify(
-                error="assistant_id does not match public_id",
-                expected=slug,
-                provided=assistant_id
-            ), 400
-
-        # --- Finance clerk (stateful wizard) ---
-        if slug == "finance_clerk":
-            if _is_greeting(message):
-                return jsonify(public_id=public_id, assistant_slug=slug,
-                               reply="Γράψε μια καταχώρηση, π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026”.")
-
-            client_id = _get_client_id_for_state(public_id)
-            norm_msg = _norm(message)
-
-            # cancel/reset current pending
-            if norm_msg in ("ακυρο", "ακυρώ", "akuro", "cancel", "reset", "clear"):
-                finance_pending_clear(public_id, client_id)
-                return jsonify(public_id=public_id, assistant_slug=slug, reply="ΟΚ, ακυρώθηκε η τρέχουσα καταχώρηση ✅")
-
-            pending = finance_pending_get(public_id, client_id) or {}
-            fields = parse_finance_fields(message)
-
-            date_in_msg = bool(_DATE_RE.search(message))
-
-            # Start new entry if message looks like one (amount + (property or type))
-            if looks_like_new_entry(fields):
-                pending = {
-                    "entry_type": fields.get("entry_type"),
-                    "property_slug": fields.get("property_slug"),
-                    "amount": fields.get("amount"),
-                    "entry_date": fields.get("entry_date"),
-                    "category": fields.get("category"),
-                    "label": fields.get("label"),
-                    "raw_text": fields.get("raw_text") or message.strip(),
-                }
-            else:
-                # If no pending and message isn't an entry, guide user
-                if not pending:
-                    return jsonify(public_id=public_id, assistant_slug=slug,
-                                   reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Πλήρωσα νερό Βουρβουρού 20€” ή “Εισέπραξα Airbnb 300€”.")
-                # Merge into pending (slot filling)
-                if not pending.get("entry_type") and fields.get("entry_type"):
-                    pending["entry_type"] = fields["entry_type"]
-                if not pending.get("property_slug") and fields.get("property_slug"):
-                    pending["property_slug"] = fields["property_slug"]
-                if pending.get("amount") is None and fields.get("amount") is not None:
-                    pending["amount"] = fields["amount"]
-                if date_in_msg:
-                    pending["entry_date"] = fields.get("entry_date") or pending.get("entry_date")
-
-                # category: upgrade from uncategorized if we found a better one
-                if fields.get("category") and fields.get("category") != "uncategorized":
-                    pending["category"] = fields["category"]
-
-                if not pending.get("label") and fields.get("label"):
-                    pending["label"] = fields["label"]
-
-                # keep raw text history
-                rt = (pending.get("raw_text") or "").strip()
-                msg2 = message.strip()
-                if msg2 and msg2 not in rt:
-                    pending["raw_text"] = (rt + " | " + msg2).strip(" |")
-
-            # merchant map: if still uncategorized, try guess
-            if (pending.get("category") in (None, "", "uncategorized")):
-                guess = merchant_map_guess_category(pending.get("raw_text") or "")
-                if guess:
-                    pending["category"] = guess
-
-            miss = missing_fields(pending)
-            if miss:
-                finance_pending_upsert(public_id, client_id, pending)
-                return jsonify(public_id=public_id, assistant_slug=slug, reply=_ask_next_missing(miss))
-
-            # ready to commit
-            entry = {
-                "id": str(uuid.uuid4()),
-                "entry_date": pending.get("entry_date") or date.today().isoformat(),
-                "property_slug": pending["property_slug"],
-                "entry_type": pending["entry_type"],
-                "amount": float(pending["amount"]),
-                "currency": "EUR",
-                "category": pending.get("category") or "uncategorized",
-                "label": pending.get("label") or None,
-                "note": None,
-                "raw_text": pending.get("raw_text") or message.strip(),
-            }
-
-            finance_insert(entry)
+        if norm_msg in ("ακυρο", "ακυρω", "cancel", "reset", "clear"):
             finance_pending_clear(public_id, client_id)
+            return jsonify(reply="ΟΚ, ακυρώθηκε η τρέχουσα καταχώρηση ✅")
 
-            return jsonify(
-                public_id=public_id,
-                assistant_slug=slug,
-                reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}",
-            )
+        pending = finance_pending_get(public_id, client_id) or {}
+        fields = parse_finance_fields(message)
+        date_in_msg = bool(_DATE_RE.search(message))
 
-        # --- Default: LLM assistant ---
-        reply_text = _run_assistant(a, message)
-        return jsonify(public_id=public_id, assistant_slug=slug, reply=reply_text)
+        if looks_like_new_entry(fields):
+            pending = {
+                "entry_type": fields.get("entry_type"),
+                "property_slug": fields.get("property_slug"),
+                "amount": fields.get("amount"),
+                "entry_date": fields.get("entry_date"),
+                "category": fields.get("category"),
+                "label": fields.get("label"),
+                "raw_text": fields.get("raw_text") or message.strip(),
+            }
+        else:
+            if not pending:
+                return jsonify(reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Πλήρωσα νερό Βουρβουρού 20€” ή “Εισέπραξα Airbnb 300€”.")
 
-    except Exception as e:
-        app.logger.exception("public_chat failed")
-        return jsonify(error=str(e), type=type(e).__name__), 500
+            if not pending.get("entry_type") and fields.get("entry_type"):
+                pending["entry_type"] = fields["entry_type"]
+            if not pending.get("property_slug") and fields.get("property_slug"):
+                pending["property_slug"] = fields["property_slug"]
+            if pending.get("amount") is None and fields.get("amount") is not None:
+                pending["amount"] = fields["amount"]
+            if date_in_msg:
+                pending["entry_date"] = fields.get("entry_date") or pending.get("entry_date")
+
+            if fields.get("category") and fields.get("category") != "uncategorized":
+                pending["category"] = fields["category"]
+            if not pending.get("label") and fields.get("label"):
+                pending["label"] = fields["label"]
+
+            rt = (pending.get("raw_text") or "").strip()
+            msg2 = message.strip()
+            if msg2 and msg2 not in rt:
+                pending["raw_text"] = (rt + " | " + msg2).strip(" |")
+
+        if pending.get("category") in (None, "", "uncategorized"):
+            guess = merchant_map_guess_category(pending.get("raw_text") or "")
+            if guess:
+                pending["category"] = guess
+
+        miss = missing_fields(pending)
+        if miss:
+            finance_pending_upsert(public_id, client_id, pending)
+            return jsonify(reply=_ask_next_missing(miss))
+
+        entry = {
+            "id": str(uuid.uuid4()),
+            "entry_date": pending.get("entry_date") or date.today().isoformat(),
+            "property_slug": pending["property_slug"],
+            "entry_type": pending["entry_type"],
+            "amount": float(pending["amount"]),
+            "currency": "EUR",
+            "category": pending.get("category") or "uncategorized",
+            "label": pending.get("label") or None,
+            "note": None,
+            "raw_text": pending.get("raw_text") or message.strip(),
+        }
+
+        finance_insert(entry)
+        finance_pending_clear(public_id, client_id)
+
+        return jsonify(reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}")
+
+    # default LLM
+    reply_text = _run_assistant(a, message)
+    return jsonify(reply=reply_text)
 
 
 # ---------------------------
@@ -1622,7 +1414,7 @@ def public_chat(public_id):
 # ---------------------------
 @app.post("/p/<public_id>/finance/undo_last")
 def finance_undo_last(public_id):
-    a, err = _finance_auth_and_get_clerk(public_id)
+    _, err = _finance_auth_and_get_clerk(public_id)
     if err:
         return err
 
@@ -1637,30 +1429,16 @@ def finance_undo_last(public_id):
     if not con:
         return jsonify(error="db_not_configured"), 500
 
-    entry_id = None
     try:
         with con:
             with con.cursor() as cur:
                 if property_slug:
                     cur.execute(
-                        """
-                        SELECT id
-                        FROM finance_entries
-                        WHERE property_slug=%s
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """,
-                        (property_slug,)
+                        "SELECT id FROM finance_entries WHERE property_slug=%s ORDER BY created_at DESC LIMIT 1",
+                        (property_slug,),
                     )
                 else:
-                    cur.execute(
-                        """
-                        SELECT id
-                        FROM finance_entries
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                        """
-                    )
+                    cur.execute("SELECT id FROM finance_entries ORDER BY created_at DESC LIMIT 1")
 
                 row = cur.fetchone()
                 if not row:
@@ -1678,12 +1456,10 @@ def finance_undo_last(public_id):
         except Exception:
             pass
 
-              
-
 
 @app.post("/p/<public_id>/finance/delete")
 def finance_delete(public_id):
-    a, err = _finance_auth_and_get_clerk(public_id)
+    _, err = _finance_auth_and_get_clerk(public_id)
     if err:
         return err
 
@@ -1710,7 +1486,7 @@ def finance_delete(public_id):
 
 @app.get("/p/<public_id>/finance/recent")
 def finance_recent(public_id):
-    a, err = _finance_auth_and_get_clerk(public_id)
+    _, err = _finance_auth_and_get_clerk(public_id)
     if err:
         return err
 
@@ -1730,22 +1506,16 @@ def finance_recent(public_id):
         with con.cursor(cursor_factory=RealDictCursor) as cur:
             if prop:
                 cur.execute(
-    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
-    "FROM finance_entries "
-    "WHERE property_slug=%s "
-    "ORDER BY created_at DESC "
-    "LIMIT %s",
-    (prop, limit)
-)
+                    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
+                    "FROM finance_entries WHERE property_slug=%s ORDER BY created_at DESC LIMIT %s",
+                    (prop, limit),
+                )
             else:
                 cur.execute(
-    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
-    "FROM finance_entries "
-    "ORDER BY created_at DESC "
-    "LIMIT %s",
-    (limit,)
-)
-
+                    "SELECT id, created_at, entry_date, property_slug, entry_type, amount, currency, category, label "
+                    "FROM finance_entries ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
             rows = cur.fetchall()
 
     con.close()
@@ -1754,7 +1524,7 @@ def finance_recent(public_id):
 
 @app.get("/p/<public_id>/finance/summary")
 def finance_summary(public_id):
-    a, err = _finance_auth_and_get_clerk(public_id)
+    _, err = _finance_auth_and_get_clerk(public_id)
     if err:
         return err
 
@@ -1763,7 +1533,6 @@ def finance_summary(public_id):
     prop = (request.args.get("property_slug") or "").strip() or None
     entry_type = (request.args.get("type") or "").strip() or None
 
-    # basic validation (ISO date)
     def _valid_date(s):
         if not s:
             return True
@@ -1804,121 +1573,93 @@ def finance_summary(public_id):
             rows = cur.fetchall()
     con.close()
 
-    # normalize output
     out = {"expense": {"count": 0, "total": 0}, "income": {"count": 0, "total": 0}}
     for r in rows:
         et = r.get("entry_type")
         out[et] = {"count": int(r.get("count") or 0), "total": float(r.get("total") or 0)}
 
     return jsonify(ok=True, filters={"from": date_from, "to": date_to, "property_slug": prop, "type": entry_type}, summary=out)
+
+
 @app.get("/p/<public_id>/report.csv")
 def finance_report_csv(public_id):
-    try:
-        a = _get_public_assistant(public_id)
-        if a is None:
-            return jsonify(error="assistant_not_found"), 404
-        if not _assistant_enabled(a):
-            return jsonify(error="assistant_disabled"), 404
+    a = _get_public_assistant(public_id)
+    if a is None or not _assistant_enabled(a):
+        return jsonify(error="assistant_not_found_or_disabled"), 404
 
-        cfg = _assistant_config(a)
-        require_key_if_needed(cfg)
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
 
-        slug = str(_assistant_id(a) or "")
-        if slug != "finance_clerk":
-            return jsonify(error="not_finance_clerk", slug=slug), 404
+    slug = str(_assistant_id(a) or "")
+    if slug != "finance_clerk":
+        return jsonify(error="not_finance_clerk"), 404
 
-        entry_type = (request.args.get("type") or "").strip() or None
-        property_slug = (request.args.get("property") or "").strip() or None
-        date_from = (request.args.get("from") or "").strip() or None
-        date_to = (request.args.get("to") or "").strip() or None
+    entry_type = (request.args.get("type") or "").strip() or None
+    property_slug = (request.args.get("property") or "").strip() or None
+    date_from = (request.args.get("from") or "").strip() or None
+    date_to = (request.args.get("to") or "").strip() or None
 
-        rows = finance_list(
-            limit=50000,
-            property_slug=property_slug,
-            entry_type=entry_type,
-            date_from=date_from,
-            date_to=date_to,
-        )
+    rows = finance_list(limit=50000, property_slug=property_slug, entry_type=entry_type, date_from=date_from, date_to=date_to)
 
-        import io, csv
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
-        for r in rows:
-            w.writerow([
-                r.get("entry_date"),
-                r.get("property_slug"),
-                r.get("entry_type"),
-                r.get("amount"),
-                r.get("currency", "EUR"),
-                r.get("category", ""),
-                r.get("label", ""),
-                r.get("id"),
-            ])
+    buf = StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
+    for r in rows:
+        w.writerow([
+            r.get("entry_date"),
+            r.get("property_slug"),
+            r.get("entry_type"),
+            r.get("amount"),
+            r.get("currency", "EUR"),
+            r.get("category", ""),
+            r.get("label", ""),
+            r.get("id"),
+        ])
 
-        csv_text = "\ufeff" + buf.getvalue()  # BOM for OpenOffice Greek
-        resp = make_response(csv_text)
-        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-        resp.headers["Content-Disposition"] = "attachment; filename=finance_report.csv"
-        return resp
-
-    except HTTPException as e:
-        return jsonify(error="unauthorized", detail=str(e)), (e.code or 401)
-    except Exception as e:
-        app.logger.exception("finance_report_csv failed")
-        return jsonify(error="report_failed", detail=str(e)), 500
+    csv_text = "\ufeff" + buf.getvalue()
+    resp = make_response(csv_text)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=finance_report.csv"
+    return resp
 
 
 @app.get("/p/<public_id>/export.csv")
 def finance_export(public_id):
-    try:
-        a = _get_public_assistant(public_id)
-        if a is None:
-            return jsonify(error="assistant_not_found"), 404
-        if not _assistant_enabled(a):
-            return jsonify(error="assistant_disabled"), 404
+    a = _get_public_assistant(public_id)
+    if a is None or not _assistant_enabled(a):
+        return jsonify(error="assistant_not_found_or_disabled"), 404
 
-        cfg = _assistant_config(a)
-        try:
-            require_key_if_needed(cfg)
-        except HTTPException as e:
-            return jsonify(error="unauthorized", code=e.code), (e.code or 401)
+    cfg = _assistant_config(a)
+    require_key_if_needed(cfg)
 
-        slug = str(_assistant_id(a) or "")
-        if slug != "finance_clerk":
-            return jsonify(error="not_finance_clerk", slug=slug), 404
+    slug = str(_assistant_id(a) or "")
+    if slug != "finance_clerk":
+        return jsonify(error="not_finance_clerk"), 404
 
-        rows = finance_list(limit=5000)
+    rows = finance_list(limit=5000)
 
-        import io, csv
-        buf = io.StringIO()
-        w = csv.writer(buf, lineterminator="\r\n")
-        w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
-        for r in rows:
-            w.writerow([
-                r.get("entry_date"),
-                r.get("property_slug"),
-                r.get("entry_type"),
-                r.get("amount"),
-                r.get("currency", "EUR"),
-                r.get("category", ""),
-                r.get("label", ""),
-                r.get("id"),
-            ])
+    buf = StringIO()
+    w = csv.writer(buf, lineterminator="\r\n")
+    w.writerow(["date", "property", "type", "amount", "currency", "category", "label", "id"])
+    for r in rows:
+        w.writerow([
+            r.get("entry_date"),
+            r.get("property_slug"),
+            r.get("entry_type"),
+            r.get("amount"),
+            r.get("currency", "EUR"),
+            r.get("category", ""),
+            r.get("label", ""),
+            r.get("id"),
+        ])
 
-        csv_text = "\ufeff" + buf.getvalue()
-        resp = make_response(csv_text)
-        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-        resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
-        return resp
-
-    except Exception as e:
-        app.logger.exception("finance_export failed")
-        return jsonify(error="export_failed", detail=str(e)), 500
+    csv_text = "\ufeff" + buf.getvalue()
+    resp = make_response(csv_text)
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=finance_entries.csv"
+    return resp
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5050"))
     app.run(host="0.0.0.0", port=port, debug=DEBUG_MODE)
-
-
