@@ -1509,8 +1509,7 @@ def public_chat(public_id):
             guess = merchant_map_guess_category(pending.get("raw_text") or "")
             if guess:
                 pending["category"] = guess
-
-               miss = missing_fields(pending)
+        miss = missing_fields(pending)
         if miss:
             finance_pending_upsert(public_id, client_id, pending)
             return jsonify(reply=_ask_next_missing(miss))
@@ -1540,7 +1539,6 @@ def public_chat(public_id):
         finance_pending_clear(public_id, client_id)
 
         return jsonify(reply=f"Καταχωρήθηκε ✅ {entry['entry_type']} {entry['amount']}€ | {entry['property_slug']} | {entry['entry_date']} | {entry['category']}")
-
     # default LLM
     reply_text = _run_assistant(a, message)
     return jsonify(reply=reply_text)
