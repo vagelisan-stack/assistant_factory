@@ -732,14 +732,21 @@ def _parse_report_request(message: str):
         return None
     low = _norm(raw)
 
-    entry_type = _detect_report_entry_type(raw)
+    rng = _detect_date_range(raw)  # επιστρέφει (from,to) μόνο αν βρει >=2 ημερομηνίες
+    has_prefix = any(low.startswith(p) for p in REPORT_PREFIXES)
+    has_hint = any(h in low for h in _REPORT_HINTS) or ("εξοδ" in low) or ("εσοδ" in low) or ("κιν" in low)
+
+    # Αν δεν μοιάζει με report, μην επιστρέφεις τίποτα (ΑΥΤΟ σου έλειπε)
+    if not (has_prefix or has_hint or rng):
+        return None
+
+    entry_type = _detect_report_entry_type(raw)      # expense/income/None
     property_slug = _detect_report_property(raw)
 
     date_from = None
     date_to = None
 
     # 1) explicit range wins
-    rng = _detect_date_range(raw)
     if rng:
         date_from, date_to = rng
 
@@ -761,7 +768,6 @@ def _parse_report_request(message: str):
         date_from, date_to = rng3
 
     return {"entry_type": entry_type, "property_slug": property_slug, "date_from": date_from, "date_to": date_to}
-
 
 
 def handle_report_in_chat(public_id: str, message: str):
@@ -1435,10 +1441,13 @@ def public_chat(public_id):
     # finance_clerk wizard + reports
     if slug == "finance_clerk":
         # Report intent priority
-        rep = handle_report_in_chat(public_id, message)
-        if rep:
-            return jsonify(rep)
+        fields = parse_finance_fields(message)
+        is_entryish = looks_like_new_entry(fields) or looks_like_entry_intent(message, fields)
 
+        if not is_entryish:
+            rep = handle_report_in_chat(public_id, message)
+            if rep:
+                return jsonify(rep)
         if _is_greeting(message):
             return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
 
