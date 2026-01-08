@@ -669,50 +669,21 @@ def _clean_date_token(tok: str) -> str:
     return (tok or "").strip().strip(strip_chars)
 
 def _detect_date_range(message: str):
-    """
-    Returns (date_from, date_to) in YYYY-MM-DD if it can find a range.
-    Understands:
-      - "απο 6/1/2026 εως 8/1/2026"
-      - "from 6/1/2026 to 8/1/2026"
-      - "6/1/2026-8/1/2026"
-      - "2026-01-06 έως 2026-01-08"
-    """
-    low = _norm(message)
+    # βρίσκει ΟΛΑ τα date tokens και παίρνει τα 2 πρώτα (ή min/max)
+    if not message:
+        return None
 
-    # explicit "απο X εως Y" / "from X to Y"
-    m = re.search(r"\b(?:απο|from)\s+(\S+)\s+\b(?:εως|μεχρι|to)\s+(\S+)\b", low)
-    if m:
-        a = _clean_date_token(m.group(1))
-        b = _clean_date_token(m.group(2))
-        df = _parse_date_token(a)
-        dt = _parse_date_token(b)
-        if df and dt:
-            if dt < df:
-                df, dt = dt, df
-            return df, dt
+    tokens = re.findall(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", _norm(message))
+    parsed = []
+    for t in tokens:
+        d = _parse_date_token(t)
+        if d:
+            parsed.append(d)
 
-    # dashed form "X - Y"
-    m = re.search(
-        r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:-|–|—)\s*(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
-        low
-    )
-    if m:
-        df = _parse_date_token(_clean_date_token(m.group(1)))
-        dt = _parse_date_token(_clean_date_token(m.group(2)))
-        if df and dt:
-            if dt < df:
-                df, dt = dt, df
-            return df, dt
-
-    # fallback: if message contains 2 date tokens anywhere, treat them as a range
-    tokens = re.findall(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", low)
-    if len(tokens) >= 2:
-        df = _parse_date_token(tokens[0])
-        dt = _parse_date_token(tokens[1])
-        if df and dt:
-            if dt < df:
-                df, dt = dt, df
-            return df, dt
+    if len(parsed) >= 2:
+        df = min(parsed)
+        dt = max(parsed)
+        return (df, dt)
 
     return None
 
@@ -819,14 +790,8 @@ def _parse_report_request(message: str):
         rng3 = _month_range(f"{today.year:04d}-{today.month:02d}")
         date_from, date_to = rng3
 
-
-    # 4) fallback: current month
-    if not date_from:
-        today = date.today()
-        r3 = _month_range(f"{today.year:04d}-{today.month:02d}")
-        date_from, date_to = r3
-
     return {"entry_type": entry_type, "property_slug": property_slug, "date_from": date_from, "date_to": date_to}
+
 
 
 def handle_report_in_chat(public_id: str, message: str):
