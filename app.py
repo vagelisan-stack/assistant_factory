@@ -664,7 +664,9 @@ def _parse_date_token(tok: str):
     return None
 
 def _clean_date_token(tok: str) -> str:
-    return (tok or "").strip().strip('"\''"“”()[]{}.,;:!?'"")
+    # strip surrounding punctuation/quotes safely
+    strip_chars = "\"'“”()[]{}.,;:!?"
+    return (tok or "").strip().strip(strip_chars)
 
 def _detect_date_range(message: str):
     """
