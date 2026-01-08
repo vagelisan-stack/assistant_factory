@@ -7,3 +7,26 @@ secrets.ps1
 
 # ignore whole local fava_guest dump
 /assistants/fava_guest/
+
+# Local secrets / environment
+.env
+.env.*
+admin_key.txt
+finance_key.txt
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Local tooling & temp
+.venv/
+debug_parse.py
+
+# Local request bodies / scratch
+body.json
+req.json
+
+# Backups
+backup_*.zip
+backup_*/
+
