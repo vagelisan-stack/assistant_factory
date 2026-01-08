@@ -663,6 +663,58 @@ def _parse_date_token(tok: str):
 
     return None
 
+def _clean_date_token(tok: str) -> str:
+    return (tok or "").strip().strip('"\''"“”()[]{}.,;:!?'"")
+
+def _detect_date_range(message: str):
+    """
+    Returns (date_from, date_to) in YYYY-MM-DD if it can find a range.
+    Understands:
+      - "απο 6/1/2026 εως 8/1/2026"
+      - "from 6/1/2026 to 8/1/2026"
+      - "6/1/2026-8/1/2026"
+      - "2026-01-06 έως 2026-01-08"
+    """
+    low = _norm(message)
+
+    # explicit "απο X εως Y" / "from X to Y"
+    m = re.search(r"\b(?:απο|from)\s+(\S+)\s+\b(?:εως|μεχρι|to)\s+(\S+)\b", low)
+    if m:
+        a = _clean_date_token(m.group(1))
+        b = _clean_date_token(m.group(2))
+        df = _parse_date_token(a)
+        dt = _parse_date_token(b)
+        if df and dt:
+            if dt < df:
+                df, dt = dt, df
+            return df, dt
+
+    # dashed form "X - Y"
+    m = re.search(
+        r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:-|–|—)\s*(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b",
+        low
+    )
+    if m:
+        df = _parse_date_token(_clean_date_token(m.group(1)))
+        dt = _parse_date_token(_clean_date_token(m.group(2)))
+        if df and dt:
+            if dt < df:
+                df, dt = dt, df
+            return df, dt
+
+    # fallback: if message contains 2 date tokens anywhere, treat them as a range
+    tokens = re.findall(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", low)
+    if len(tokens) >= 2:
+        df = _parse_date_token(tokens[0])
+        dt = _parse_date_token(tokens[1])
+        if df and dt:
+            if dt < df:
+                df, dt = dt, df
+            return df, dt
+
+    return None
+
+
 
 def _month_range(ym: str):
     if not re.fullmatch(r"\d{4}-\d{2}", ym or ""):
@@ -743,35 +795,28 @@ def _parse_report_request(message: str):
     date_from = None
     date_to = None
 
-    # 1) explicit date range anywhere in the message (priority)
+    # 1) explicit range wins
     rng = _detect_date_range(raw)
     if rng:
         date_from, date_to = rng
 
-    # 2) decide if this is a report intent
-    is_report = False
-    if rng:
-        is_report = True
-    elif any(low.startswith(p) for p in REPORT_PREFIXES):
-        is_report = True
-    elif any(h in low for h in _REPORT_HINTS):
-        is_report = True
-    elif ("εξοδ" in low) or ("εσοδ" in low):
-        is_report = True
-
-    if not is_report:
-        return None
-
-    # 3) month requests (only if no explicit range already)
+    # 2) month (current or YYYY-MM) only if no explicit range
     if not date_from and (("μηνα" in low) or ("μήνα" in (message or "")) or ("month" in low)):
         m = re.search(r"\b(\d{4}-\d{2})\b", low)
         if m:
-            r2 = _month_range(m.group(1))
+            rng2 = _month_range(m.group(1))
         else:
             today = date.today()
-            r2 = _month_range(f"{today.year:04d}-{today.month:02d}")
-        if r2:
-            date_from, date_to = r2
+            rng2 = _month_range(f"{today.year:04d}-{today.month:02d}")
+        if rng2:
+            date_from, date_to = rng2
+
+    # 3) fallback: current month
+    if not date_from:
+        today = date.today()
+        rng3 = _month_range(f"{today.year:04d}-{today.month:02d}")
+        date_from, date_to = rng3
+
 
     # 4) fallback: current month
     if not date_from:
