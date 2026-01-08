@@ -700,42 +700,6 @@ def _month_range(ym: str):
 _DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)")
 
 
-def _detect_date_range(message: str):
-    raw = (message or "").strip()
-    if not raw:
-        return None
-
-    low = _norm(raw)
-
-    # Pattern: "από X έως Y" / "απο X μεχρι Y" / "from X to Y"
-    m = re.search(
-        r"(?:\bαπο\b|\bαπό\b|\bfrom\b)\s+(" + _DATE_TOKEN_RE.pattern + r")\s+"
-        r"(?:\bεως\b|\bέως\b|\bμεχρι\b|\bμέχρι\b|\bto\b|\buntil\b)\s+(" + _DATE_TOKEN_RE.pattern + r")",
-        low
-    )
-    if m:
-        df = _parse_date_token(m.group(1))
-        dt = _parse_date_token(m.group(2))
-        if df and dt:
-            return (df, dt)
-
-    # Pattern: "DATE - DATE"
-    m = re.search(r"(" + _DATE_TOKEN_RE.pattern + r")\s*-\s*(" + _DATE_TOKEN_RE.pattern + r")", low)
-    if m:
-        df = _parse_date_token(m.group(1))
-        dt = _parse_date_token(m.group(2))
-        if df and dt:
-            return (df, dt)
-
-    # Fallback: 2 date tokens + some range hint anywhere
-    toks = _DATE_TOKEN_RE.findall(low)
-    if len(toks) >= 2 and any(h in low for h in _RANGE_HINTS):
-        df = _parse_date_token(toks[0])
-        dt = _parse_date_token(toks[1])
-        if df and dt:
-            return (df, dt)
-
-    return None
 
 
 def _detect_report_entry_type(msg: str):
