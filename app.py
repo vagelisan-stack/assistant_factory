@@ -51,9 +51,6 @@ db_store = DBAssistantStore(DATABASE_URL) if DATABASE_URL else None
 if db_store:
     db_store.init_db()
 
-import os
-from flask import jsonify
-
 
 @app.errorhandler(Exception)
 def _handle_any_exception(e):
@@ -74,6 +71,34 @@ def _rec_get(rec, key, default=None):
     if isinstance(rec, dict):
         return rec.get(key, default)
     return getattr(rec, key, default)
+
+def looks_like_entry_intent(message: str, fields: dict) -> bool:
+    # όχι για χαιρετούρες
+    if _is_greeting(message):
+        return False
+
+    tl = _norm(message)
+
+    action_words = [
+        "πληρωσα", "πληωσα", "εδωσα", "αγορασα", "ψωνισα", "χρεωθηκα",
+        "εβαλα", "βαλα", "ηπια", "εφαγα", "επαιξα",
+        "εισπραξα", "ελαβα", "μπηκαν", "πληρωθηκα"
+    ]
+
+    # Αν έχει “ρήμα δράσης”, είναι καταχώρηση ακόμα κι αν λείπουν στοιχεία.
+    if any(w in tl for w in action_words):
+        return True
+
+    # Αν έχει ποσό και ένδειξη (category/type/property), είναι καταχώρηση.
+    if fields.get("amount") is not None:
+        cat = fields.get("category")
+        if cat and cat != "uncategorized":
+            return True
+        if fields.get("entry_type") or fields.get("property_slug"):
+            return True
+
+    return False
+
 
 
 def _assistant_id(a):
@@ -389,8 +414,31 @@ def _norm(s: str) -> str:
     return s
 
 
-_EXPENSE_WORDS = ["πληρωσα", "εδωσα", "αγορασα", "ψωνισα", "χρεωθηκα", "εξοδο", "expense"]
+_EXPENSE_WORDS = [
+    "πληρωσα", "πληωσα",  # πιάνει και το συχνό typo
+    "εδωσα", "αγορασα", "ψωνισα", "χρεωθηκα",
+    "εβαλα", "βαλα",      # βενζίνη κλπ
+    "ηπια", "εφαγα",      # καφέ/φαγητό
+    "επαιξα",             # τζόκερ/στοίχημα
+    "εξοδο", "expense"
+]
+
+_INCOME_WORDS = [
+    "εισπραξα", "πηρα", "πληρωθηκα", "ελαβα", "μπηκαν",
+    "εσοδο", "income"
+]
+
 _INCOME_WORDS  = ["εισπραξα", "πηρα", "πληρωθηκα", "ελαβα", "μπηκαν", "εσοδο", "income"]
+
+_ACTION_WORDS = [
+    "πληρωσα", "πληωσα", "εδωσα", "αγορασα", "ψωνισα", "χρεωθηκα",
+    "εβαλα", "βαλα", "ηπια", "εφαγα", "επαιξα",
+    "εισπραξα", "ελαβα", "μπηκαν", "πληρωθηκα"
+]
+
+def _has_action_word(t: str) -> bool:
+    tl = _norm(t)
+    return any(w in tl for w in _ACTION_WORDS)
 
 _PROP_MAP = {
     "thessaloniki": ["θεσσαλονικη", "θεσ", "thessaloniki"],
@@ -398,20 +446,28 @@ _PROP_MAP = {
 }
 
 _CAT_RULES = [
-    ("utilities", ["δεη","ρευμα","νερο","ιντερνετ","internet","κοινοχρηστα"]),
-    ("home_maintenance", ["συντηρ","επισκευ","υδραυλ","ηλεκτρολογ","κηπ","garden","service","repair"]),
-    ("groceries", ["σουπερ","μαρκετ","τροφ","supermarket","mini market","minimarket","super market"]),
-    ("transport", ["parking","παρκινγκ","διοδια","βενζιν","fuel","diesel","service αυτοκιν","ασφαλεια αυτοκιν"]),
-    ("dining", ["εστιατ","restaurant","ταβερν","taverna","φαγητο","γευμα"]),
-    ("bars_coffee", ["καφε","coffee","μπαρ","bar","ποτο","drink","cocktail"]),
-    ("rental_income", ["airbnb","booking","ενοικ","βραχυχρον"]),
+    ("gambling", ["τζοκερ","τζόκερ","οπαπ","opap","στοιχημ","στοίχημ"]),
+    ("utilities", ["δεη", "ρεύμα", "ρευμα", "νερό", "νερο", "ιντερνετ", "internet", "κοινοχρηστα"]),
+    ("home_maintenance", ["συντηρ", "επισκευ", "υδραυλ", "ηλεκτρολογ", "κηπ", "garden", "service", "repair"]),
+    ("groceries", ["σουπερ", "μάρκετ", "μαρκετ", "τροφ", "supermarket", "mini market", "minimarket", "super market", "ψωνι"]),
+    ("fuel", ["βενζιν", "καυσιμ", "fuel", "diesel", "petrol", "gas"]),
+    ("transport", ["parking", "παρκινγκ", "διόδια", "διοδια", "εισιτηρ", "ταξι", "μετρο", "λεωφορει"]),
+    ("dining", ["εστιατ", "restaurant", "ταβερν", "taverna", "φαγητο", "γευμα", "delivery", "wolt", "efood"]),
+    ("coffee", ["καφε", "coffee", "cafe", "espresso", "latte", "cappuccino"]),
+    ("bars", ["μπαρ", "bar", "ποτο", "drink", "cocktail"]),
+    ("rental_income", ["airbnb", "booking", "ενοικ", "βραχυχρον"]),
 ]
 
 _DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
-_EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρω)?", re.IGNORECASE)
+_EUR_AMOUNT_RE = re.compile(r"(?:€\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:€|eur|euro|ευρω|ευρώ)?", re.IGNORECASE)
 _NUM_ONLY_RE = re.compile(r"^\s*\d+(?:[.,]\d{1,2})?\s*$")
 
-_LABEL_NOISE = {"θεσσαλονικη","thessaloniki","βουρβουρου","vourvourou","πληρωσα","εισπραξα","εξοδο","εσοδο"}
+_LABEL_NOISE = {"θεσσαλονικη", "thessaloniki", "βουρβουρου", "vourvourou", "πληρωσα", "εισπραξα", "εξοδο", "εσοδο"}
+
+
+def _has_action_word(t: str) -> bool:
+    tl = _norm(t)
+    return any(w in tl for w in _ACTION_WORDS)
 
 
 def _detect_property(t: str):
@@ -475,33 +531,64 @@ def _label_candidate(text: str):
 
 
 def parse_finance_fields(text: str) -> dict:
+    cat = _detect_category(text)
+    et = _detect_type(text)
+    amt = _detect_amount(text)
+
+    # Heuristic defaults:
+    # - rental_income implies income even if user didn't say "εισπραξα"
+    # - otherwise if amount exists and no explicit type, default to expense (practical, fewer questions)
+    if et is None:
+        if cat == "rental_income":
+            et = "income"
+        elif amt is not None:
+            et = "expense"
+
     return {
-        "entry_type": _detect_type(text),
+        "entry_type": et,
         "property_slug": _detect_property(text),
-        "amount": _detect_amount(text),
+        "amount": amt,
         "entry_date": _detect_date(text),
-        "category": _detect_category(text),
+        "category": cat,
         "label": _label_candidate(text),
         "raw_text": (text or "").strip(),
     }
 
 
 def missing_fields(state: dict):
+    # Ask in a human-friendly order: amount -> property -> type
     missing = []
-    if not state.get("entry_type"):
-        missing.append("type")
-    if not state.get("property_slug"):
-        missing.append("property")
     if state.get("amount") is None:
         missing.append("amount")
+    if not state.get("property_slug"):
+        missing.append("property")
+    if not state.get("entry_type"):
+        missing.append("type")
     return missing
 
 
 def looks_like_new_entry(fields: dict) -> bool:
-    has_amount = fields.get("amount") is not None
-    has_prop = bool(fields.get("property_slug"))
-    has_type = bool(fields.get("entry_type"))
-    return has_amount and (has_prop or has_type)
+    # ποσό + (τύπος ή ιδιοκτησία ή “γνωστή” κατηγορία)
+    if fields.get("amount") is None:
+        return False
+    if fields.get("entry_type") or fields.get("property_slug"):
+        return True
+    cat = fields.get("category")
+    return bool(cat and cat != "uncategorized")
+
+
+def _is_greeting(msg: str) -> bool:
+    t = _norm(msg)
+    return t in ("γεια", "γεια σου", "καλημερα", "καλησπερα", "καληνυχτα", "hello", "hi")
+
+
+def looks_like_strong_new_entry(message: str, fields: dict) -> bool:
+    # overwrite pending only if it's clearly a new entry
+    if fields.get("amount") is None:
+        return False
+    if not _has_action_word(message):
+        return False
+    return True
 
 
 def _ask_next_missing(missing: list) -> str:
@@ -515,11 +602,6 @@ def _ask_next_missing(missing: list) -> str:
     if m == "type":
         return "Είναι έξοδο ή έσοδο; (π.χ. “Πλήρωσα …” ή “Εισέπραξα …”)."
     return "Λείπουν στοιχεία. Συνέχισε με ποσό/ακίνητο/τύπο."
-
-
-def _is_greeting(msg: str) -> bool:
-    t = _norm(msg)
-    return t in ("γεια", "γεια σου", "καλημερα", "καλησπερα", "καληνυχτα", "hello", "hi")
 
 
 def _get_client_id_for_state(public_id: str) -> str:
@@ -550,6 +632,8 @@ def _finance_auth_and_get_clerk(public_id: str):
 # Reports (chat-triggered)
 # ---------------------------
 REPORT_PREFIXES = ("report", "αναφορα", "αναφορά", "δωσε μου", "δώσε μου", "πες μου", "show me", "give me")
+_RANGE_HINTS = ("απο", "από", "εως", "έως", "μεχρι", "μέχρι", "from", "to", "until")
+_REPORT_HINTS = ("αναφορα", "αναφορά", "report", "συνολο", "σύνολο", "ολα", "όλα", "μηνα", "μήνα", "month", "εβδομαδα", "εβδομάδα")
 
 
 def _parse_date_token(tok: str):
@@ -560,13 +644,18 @@ def _parse_date_token(tok: str):
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", tok):
         return tok
 
-    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", tok)
+    # dd/mm/yyyy or dd-mm-yyyy (year optional)
+    m = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2}|\d{4}))?", tok)
     if m:
         d = int(m.group(1))
         mo = int(m.group(2))
-        y = int(m.group(3))
-        if y < 100:
-            y += 2000
+        y_raw = m.group(3)
+        if y_raw is None:
+            y = date.today().year
+        else:
+            y = int(y_raw)
+            if y < 100:
+                y += 2000
         try:
             return date(y, mo, d).isoformat()
         except Exception:
@@ -581,6 +670,47 @@ def _month_range(ym: str):
     y = int(ym[:4]); m = int(ym[5:7])
     last = calendar.monthrange(y, m)[1]
     return (date(y, m, 1).isoformat(), date(y, m, last).isoformat())
+
+
+_DATE_TOKEN_RE = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)")
+
+
+def _detect_date_range(message: str):
+    raw = (message or "").strip()
+    if not raw:
+        return None
+
+    low = _norm(raw)
+
+    # Pattern: "από X έως Y" / "απο X μεχρι Y" / "from X to Y"
+    m = re.search(
+        r"(?:\bαπο\b|\bαπό\b|\bfrom\b)\s+(" + _DATE_TOKEN_RE.pattern + r")\s+"
+        r"(?:\bεως\b|\bέως\b|\bμεχρι\b|\bμέχρι\b|\bto\b|\buntil\b)\s+(" + _DATE_TOKEN_RE.pattern + r")",
+        low
+    )
+    if m:
+        df = _parse_date_token(m.group(1))
+        dt = _parse_date_token(m.group(2))
+        if df and dt:
+            return (df, dt)
+
+    # Pattern: "DATE - DATE"
+    m = re.search(r"(" + _DATE_TOKEN_RE.pattern + r")\s*-\s*(" + _DATE_TOKEN_RE.pattern + r")", low)
+    if m:
+        df = _parse_date_token(m.group(1))
+        dt = _parse_date_token(m.group(2))
+        if df and dt:
+            return (df, dt)
+
+    # Fallback: 2 date tokens + some range hint anywhere
+    toks = _DATE_TOKEN_RE.findall(low)
+    if len(toks) >= 2 and any(h in low for h in _RANGE_HINTS):
+        df = _parse_date_token(toks[0])
+        dt = _parse_date_token(toks[1])
+        if df and dt:
+            return (df, dt)
+
+    return None
 
 
 def _detect_report_entry_type(msg: str):
@@ -607,41 +737,47 @@ def _parse_report_request(message: str):
         return None
     low = _norm(raw)
 
-    is_report = any(low.startswith(p) for p in REPORT_PREFIXES) or ("εξοδ" in low) or ("εσοδ" in low)
-    if not is_report:
-        return None
-
     entry_type = _detect_report_entry_type(raw)
     property_slug = _detect_report_property(raw)
 
     date_from = None
     date_to = None
 
-    # μήνας (τρέχων ή με YYYY-MM)
-    if ("μηνα" in low) or ("μήνα" in (message or "")) or ("month" in low):
+    # 1) explicit date range anywhere in the message (priority)
+    rng = _detect_date_range(raw)
+    if rng:
+        date_from, date_to = rng
+
+    # 2) decide if this is a report intent
+    is_report = False
+    if rng:
+        is_report = True
+    elif any(low.startswith(p) for p in REPORT_PREFIXES):
+        is_report = True
+    elif any(h in low for h in _REPORT_HINTS):
+        is_report = True
+    elif ("εξοδ" in low) or ("εσοδ" in low):
+        is_report = True
+
+    if not is_report:
+        return None
+
+    # 3) month requests (only if no explicit range already)
+    if not date_from and (("μηνα" in low) or ("μήνα" in (message or "")) or ("month" in low)):
         m = re.search(r"\b(\d{4}-\d{2})\b", low)
         if m:
-            rng = _month_range(m.group(1))
+            r2 = _month_range(m.group(1))
         else:
             today = date.today()
-            rng = _month_range(f"{today.year:04d}-{today.month:02d}")
-        if rng:
-            date_from, date_to = rng
+            r2 = _month_range(f"{today.year:04d}-{today.month:02d}")
+        if r2:
+            date_from, date_to = r2
 
-    # "απο X εως Y"
-    if not date_from:
-        m = re.search(r"\bαπο\s+(\S+)\s+εως\s+(\S+)", low)
-        if m:
-            df = _parse_date_token(m.group(1))
-            dt = _parse_date_token(m.group(2))
-            if df and dt:
-                date_from, date_to = df, dt
-
-    # fallback: current month
+    # 4) fallback: current month
     if not date_from:
         today = date.today()
-        rng = _month_range(f"{today.year:04d}-{today.month:02d}")
-        date_from, date_to = rng
+        r3 = _month_range(f"{today.year:04d}-{today.month:02d}")
+        date_from, date_to = r3
 
     return {"entry_type": entry_type, "property_slug": property_slug, "date_from": date_from, "date_to": date_to}
 
@@ -1316,12 +1452,13 @@ def public_chat(public_id):
 
     # finance_clerk wizard + reports
     if slug == "finance_clerk":
+        # Report intent priority
         rep = handle_report_in_chat(public_id, message)
         if rep:
             return jsonify(rep)
 
         if _is_greeting(message):
-            return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα μήνα”.")
+            return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
 
         client_id = _get_client_id_for_state(public_id)
         norm_msg = _norm(message)
@@ -1333,7 +1470,7 @@ def public_chat(public_id):
         pending = finance_pending_get(public_id, client_id) or {}
         fields = parse_finance_fields(message)
 
-        # Admin-only debug: see what the server parsed
+        # Admin-only debug
         if request.args.get("debug") == "1":
             expected = (os.getenv("ADMIN_API_KEY") or "").strip()
             provided = (request.headers.get("X-ADMIN-KEY") or "").strip()
@@ -1350,21 +1487,17 @@ def public_chat(public_id):
                 pending=pending,
             ), 200
 
-
-        # --- compatibility mapping (accept old key names) ---
-        if fields.get("entry_type") is None and fields.get("type") is not None:
-            fields["entry_type"] = fields["type"]
-
-        if fields.get("property_slug") is None and fields.get("property") is not None:
-            fields["property_slug"] = fields["property"]
-
-        if fields.get("entry_date") is None and fields.get("date") is not None:
-            fields["entry_date"] = fields["date"]
-        # ---------------------------------------------------
+        # If we already have pending, overwrite it only if user clearly started a NEW entry
+        if pending and looks_like_strong_new_entry(message, fields):
+            pending = {}
 
         date_in_msg = bool(_DATE_RE.search(message))
 
-        if looks_like_new_entry(fields):
+        is_entryish = looks_like_new_entry(fields) or looks_like_entry_intent(message, fields)
+
+        if not pending:
+            if not is_entryish:
+                return jsonify(reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Νερό Βουρβουρού 20€” ή “Airbnb 300€” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
             pending = {
                 "entry_type": fields.get("entry_type"),
                 "property_slug": fields.get("property_slug"),
@@ -1374,11 +1507,8 @@ def public_chat(public_id):
                 "label": fields.get("label"),
                 "raw_text": fields.get("raw_text") or message.strip(),
             }
-
         else:
-            if not pending:
-                return jsonify(reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Πλήρωσα νερό Βουρβουρού 20€” ή “Εισέπραξα Airbnb 300€”.")
-
+            # fill missing pieces
             if not pending.get("entry_type") and fields.get("entry_type"):
                 pending["entry_type"] = fields["entry_type"]
             if not pending.get("property_slug") and fields.get("property_slug"):
@@ -1398,6 +1528,7 @@ def public_chat(public_id):
             if msg2 and msg2 not in rt:
                 pending["raw_text"] = (rt + " | " + msg2).strip(" |")
 
+        # merchant map can override uncategorized
         if pending.get("category") in (None, "", "uncategorized"):
             guess = merchant_map_guess_category(pending.get("raw_text") or "")
             if guess:
