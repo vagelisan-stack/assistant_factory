@@ -631,7 +631,7 @@ def _finance_auth_and_get_clerk(public_id: str):
 # ---------------------------
 # Reports (chat-triggered)
 # ---------------------------
-REPORT_PREFIXES = ("report", "αναφορα", "αναφορά", "δωσε μου", "δώσε μου", "πες μου", "show me", "give me")
+REPORT_PREFIXES = ("report", "αναφορα", "αναφορά", "δωσε μου", "δώσε μου", "πες μου","κινησεις", "κινήσεις", "ολα", "όλα" "show me", "give me")
 _RANGE_HINTS = ("απο", "από", "εως", "έως", "μεχρι", "μέχρι", "from", "to", "until")
 _REPORT_HINTS = ("αναφορα", "αναφορά", "report", "συνολο", "σύνολο", "ολα", "όλα", "μηνα", "μήνα", "month", "εβδομαδα", "εβδομάδα")
 
@@ -1510,10 +1510,18 @@ def public_chat(public_id):
             if guess:
                 pending["category"] = guess
 
-        miss = missing_fields(pending)
+               miss = missing_fields(pending)
         if miss:
             finance_pending_upsert(public_id, client_id, pending)
             return jsonify(reply=_ask_next_missing(miss))
+
+        # Ask for category if still uncategorized (and not already asking)
+        cat_now = (pending.get("category") or "").strip()
+        if cat_now in ("", "uncategorized") and not pending.get("awaiting_category"):
+            pending["awaiting_category"] = True
+            pending["merchant_token"] = pending.get("merchant_token") or _extract_map_token(pending.get("raw_text") or "")
+            finance_pending_upsert(public_id, client_id, pending)
+            return jsonify(reply=_ask_category())
 
         entry = {
             "id": str(uuid.uuid4()),
