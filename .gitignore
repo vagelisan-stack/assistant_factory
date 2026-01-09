@@ -30,3 +30,9 @@ req.json
 backup_*.zip
 backup_*/
 
+_rescue/
+data/
+*.bak*
+fix_*.py
+show*.py
+untabify.py
