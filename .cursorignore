@@ -1,0 +1,20 @@
+# secrets / env
+.env
+.env.*
+secrets*.ps1
+*token*.txt
+
+# backups / exports
+backup_*/
+*.zip
+*.bundle
+*.csv
+
+# local db / dumps
+*.db
+*.sqlite
+*.sqlite3
+
+# anything that might contain credentials
+**/*credentials*
+**/*private*

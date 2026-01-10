@@ -36,3 +36,20 @@ data/
 fix_*.py
 show*.py
 untabify.py
+
+# --- Local secrets (never commit) ---
+.env
+.env.*
+secrets.ps1
+secrets*.ps1
+*token*.txt
+
+# --- Backups / exports ---
+backup_*/
+*.zip
+*.csv
+*.bundle
+*.db
+*.sqlite
+*.sqlite3
+
