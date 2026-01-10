@@ -1,0 +1,11 @@
+{
+    "name": "Factory Foreman",
+    "title": "Factory Foreman",
+    "enabled": true,
+    "is_public": false,
+    "requires_key": true,
+    "model": "mistral-large-latest",
+    "temperature": 0.2,
+    "max_tokens": 1400
+  }
+  
