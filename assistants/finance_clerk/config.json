@@ -1,7 +1,21 @@
-﻿{
+{
   "slug": "finance_clerk",
   "name": "Finance Clerk (Personal)",
   "enabled": true,
   "is_public": true,
-  "requires_key": true
+  "requires_key": true,
+  "categories": [
+    "utilities",
+    "groceries",
+    "fuel",
+    "transport",
+    "home_maintenance",
+    "dining",
+    "coffee",
+    "bars",
+    "gambling",
+    "rental_income",
+    "other",
+    "clothing"
+  ]
 }
