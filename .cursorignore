@@ -17,4 +17,23 @@ backup_*/
 
 # anything that might contain credentials
 **/*credentials*
-**/*private*
+**/*private*key*
+**/*private*token*
+
+
+# python / tooling caches
+__pycache__/
+*.pyc
+
+# dotenv variants some tools create
+.envrc
+.envrc.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# common local config
+*.local.json
+*.local.yml
+*.local.yaml
