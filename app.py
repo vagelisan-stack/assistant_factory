@@ -11,6 +11,7 @@ from pathlib import Path
 from datetime import date, datetime, timezone
 from collections import defaultdict, deque
 from functools import wraps
+from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, abort, render_template_string, make_response
@@ -346,12 +347,17 @@ def finance_list(limit=50, property_slug=None, entry_type=None, date_from=None, 
         sql += " LIMIT %s"
         args.append(int(limit))
 
-    with con:
-        with con.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, args)
-            rows = cur.fetchall()
-    con.close()
-    return rows
+    try:
+        with con:
+            with con.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, args)
+                rows = cur.fetchall()
+        return rows
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
 
 # ---------------------------
@@ -374,11 +380,16 @@ def merchant_map_guess_category(text: str):
     if not con:
         return None
     tl = _norm(text)
-    with con:
-        with con.cursor() as cur:
-            cur.execute("SELECT token, category FROM finance_merchant_map")
-            rows = cur.fetchall()
-    con.close()
+    try:
+        with con:
+            with con.cursor() as cur:
+                cur.execute("SELECT token, category FROM finance_merchant_map")
+                rows = cur.fetchall()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
 
     for token, cat in rows:
         if _norm(token) in tl:
@@ -394,6 +405,8 @@ _MAP_STOPWORDS = {
     "εισπραξα", "εισέπραξα", "εβαλα", "έβαλα", "δινω", "δίνω",
     "για", "σε", "στο", "στη", "στην", "απο", "από", "με", "και",
     "το", "τα", "των", "του", "την", "τον", "μια", "ένα", "ενα",
+    # report-ish noise
+    "εξοδα", "έξοδα", "εσοδα", "έσοδα", "κινησεις", "κινήσεις", "αναφορα", "αναφορά",
     # properties / locations που ΔΕΝ θέλουμε σαν token
     "θεσσαλονικη", "θεσσαλονίκη", "βουρβουρου", "βουρβουρού",
     "vourvourou", "thessaloniki",
@@ -407,7 +420,7 @@ _MAP_AMOUNT_RE = re.compile(r"(?<!\w)\d+(?:[.,]\d+)?\s*(?:€|eur|euro)?\b", re.
 def _extract_map_token(raw_text: str) -> str:
     """
     Παίρνει raw κείμενο και επιστρέφει έναν 'merchant token' (π.χ. σκουπιδια).
-    Αφαιρεί ημερομηνίες/ποσά και αγνοεί stopwords.
+    Αφαιρεί ημερομηνίες/ποσά και αγνοεί stopwords/blocklist.
     """
     if not raw_text:
         return ""
@@ -422,54 +435,80 @@ def _extract_map_token(raw_text: str) -> str:
     t = re.sub(r"[^\w\s\u0370-\u03FF\u1F00-\u1FFF]+", " ", t)  # κρατά ελληνικά
     parts = [p for p in t.split() if p]
 
-    # φίλτρο + normalize
     stop_norm = {_norm(x) for x in _MAP_STOPWORDS}
+
+    # extra blocklist: action-ish + categories-ish + property slugs
+    extra_block = set(stop_norm)
+    extra_block.update({
+        "expense", "income",
+        "thessaloniki", "vourvourou",
+        "θεσ", "φαβα",
+    })
+
     cands = []
     for p in parts:
         np = _norm(p)
         if not np:
             continue
-        if np in stop_norm:
+        if np in extra_block:
             continue
         if len(np) < 3:
             continue
         cands.append(np)
 
-    # πάρε την τελευταία "ουσιαστική" λέξη
-    return cands[-1] if cands else ""
+    # Πάρε την τελευταία ουσιαστική λέξη, αλλά αν είναι "ύποπτη", γύρνα προς τα πίσω
+    if not cands:
+        return ""
+
+    for tok in reversed(cands):
+        if tok not in extra_block:
+            return tok
+
+    return ""
 
 
-def _allowed_categories():
+def _allowed_categories(cfg: Optional[Dict[str, Any]] = None):
     """
-    Whitelist κατηγοριών από το _CAT_RULES.
+    Αν υπάρχουν categories στο config -> ΜΟΝΟ αυτές (strict).
+    Αλλιώς fallback σε legacy _CAT_RULES.
     """
     cats = set()
-    try:
-        for cat, _keys in _CAT_RULES:
-            cats.add(cat)
-    except Exception:
-        pass
+    from_cfg = False
 
-    # extra / safety net
-    cats.update({"other", "fuel", "gambling"})
-    cats.discard("uncategorized")
+    if isinstance(cfg, dict):
+        raw = cfg.get("categories") or cfg.get("allowed_categories")
+        if isinstance(raw, list) and raw:
+            from_cfg = True
+            for x in raw:
+                s = str(x).strip().lower()
+                if s:
+                    cats.add(s)
+
+    if not from_cfg:
+        # legacy fallback
+        try:
+            for cat, _keys in (_CAT_RULES or []):
+                if cat:
+                    cats.add(str(cat).strip().lower())
+        except Exception:
+            pass
+        # safety net for legacy mode only
+        cats.add("other")
+
     cats.discard("")
     return sorted(cats)
 
 
-def _ask_category() -> str:
-    cats = _allowed_categories()
+def _ask_category(cfg: Optional[Dict[str, Any]] = None) -> str:
+    cats = _allowed_categories(cfg)
     sample = ", ".join(cats[:18]) + (", ..." if len(cats) > 18 else "")
     return (
-        "Διάλεξε κατηγορία (γράψε ένα από τα παρακάτω) ή γράψε «άστο» για να ΜΗΝ ρωτήσω ξανά:\n"
+        "Διάλεξε κατηγορία (γράψε ένα από τα παρακάτω) ή γράψε «άστο» για να μείνει uncategorized:\n"
         f"{sample}"
     )
 
 
-def _parse_category_reply(msg: str):
-    """
-    Επιστρέφει: category string, ή 'uncategorized' για skip, ή None αν invalid.
-    """
+def _parse_category_reply(msg: str, cfg: Optional[Dict[str, Any]] = None):
     if not msg:
         return None
     m = _norm(msg.strip().lower())
@@ -477,7 +516,7 @@ def _parse_category_reply(msg: str):
     if m in {"αστο", "άστο", "asto", "skip"}:
         return "uncategorized"
 
-    allowed = set(_allowed_categories())
+    allowed = set(_allowed_categories(cfg))
     if m in allowed:
         return m
 
@@ -488,13 +527,19 @@ def merchant_map_upsert(token: str, category: str):
     """
     Upsert στον πίνακα finance_merchant_map.
     Προϋπόθεση: PK/UNIQUE(token) ώστε να δουλεύει το ON CONFLICT.
+    Πολιτική: δεν μαθαίνουμε uncategorized / other.
     """
     tok = (token or "").strip().lower()
     cat = (category or "").strip().lower()
 
     if not tok or len(tok) < 3:
         return
-    if not cat or cat in {"", "uncategorized"}:
+    if not cat or cat in {"", "uncategorized", "other"}:
+        return
+
+    # blocklist safety (μην μάθεις location/action/report noise)
+    stop_norm = {_norm(x) for x in _MAP_STOPWORDS}
+    if _norm(tok) in stop_norm:
         return
 
     con = _finance_conn()
@@ -593,13 +638,16 @@ def _detect_type(t: str):
 
 
 def _detect_date(t: str):
-    m = _DATE_RE.search(t)
+    m = _DATE_RE.search(t or "")
     if not m:
         return date.today().isoformat()
-    d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if y < 100:
-        y += 2000
-    return date(y, mo, d).isoformat()
+    try:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        return date(y, mo, d).isoformat()
+    except Exception:
+        return date.today().isoformat()
 
 
 def _detect_amount(t: str):
@@ -754,7 +802,6 @@ def _finance_auth_and_get_clerk(public_id: str):
 
     return a, None
 
-
 # ---------------------------
 # Reports (chat-triggered)
 # ---------------------------
@@ -765,8 +812,13 @@ REPORT_PREFIXES = (
     "show me", "give me",
 )
 
-_REPORT_HINTS = ("αναφορα", "αναφορά", "report", "συνολο", "σύνολο", "ολα", "όλα", "μηνα", "μήνα",
-                 "month", "εβδομαδα", "εβδομάδα")
+_REPORT_HINTS = (
+    "αναφορα", "αναφορά", "report", "συνολο", "σύνολο", "ολα", "όλα",
+    "μηνα", "μήνα", "month", "εβδομαδα", "εβδομάδα",
+    # επιπλέον “σκανδάλες”
+    "εξοδ", "εσοδ", "κιν"
+)
+
 
 def _parse_date_token(tok: str):
     tok = (tok or "").strip()
@@ -799,7 +851,12 @@ def _detect_date_range(message: str):
     if not message:
         return None
 
-    tokens = re.findall(r"\b(\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", _norm(message))
+    # πιάνει: 2026-01-08, 8/1/26, 8-1-2026, αλλά και 8/1 (προαιρετικά)
+    tokens = re.findall(
+        r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?)\b",
+        _norm(message)
+    )
+
     parsed = []
     for t in tokens:
         d = _parse_date_token(t)
@@ -807,9 +864,7 @@ def _detect_date_range(message: str):
             parsed.append(d)
 
     if len(parsed) >= 2:
-        df = min(parsed)
-        dt = max(parsed)
-        return (df, dt)
+        return (min(parsed), max(parsed))
 
     return None
 
@@ -817,22 +872,33 @@ def _detect_date_range(message: str):
 def _month_range(ym: str):
     if not re.fullmatch(r"\d{4}-\d{2}", ym or ""):
         return None
-    y = int(ym[:4]); m = int(ym[5:7])
+    y = int(ym[:4])
+    m = int(ym[5:7])
     last = calendar.monthrange(y, m)[1]
     return (date(y, m, 1).isoformat(), date(y, m, last).isoformat())
 
 
 def _detect_report_entry_type(msg: str):
-    m = _norm(msg)
-    if "εξοδ" in m or re.search(r"\bexpense(s)?\b", m):
+    """
+    Detect report filter type from normalized text (τόνοι removed).
+    Returns: "expense" | "income" | None
+    (None => all movements)
+    """
+    m = _norm(msg or "")
+
+    has_exp = bool(re.search(r"\b(εξοδ\w*|exod\w*|expense(s)?)\b", m))
+    has_inc = bool(re.search(r"\b(εσοδ\w*|esod\w*|income(s)?)\b", m))
+
+    # αν γράψει και τα 2, το αντιμετωπίζουμε σαν “all”
+    if has_exp and not has_inc:
         return "expense"
-    if "εσοδ" in m or re.search(r"\bincome\b", m):
+    if has_inc and not has_exp:
         return "income"
     return None
 
 
 def _detect_report_property(msg: str):
-    m = _norm(msg)
+    m = _norm(msg or "")
     if "θεσσαλονικη" in m or "thessaloniki" in m:
         return "thessaloniki"
     if "βουρβουρου" in m or "vourvourou" in m or "φαβα" in m:
@@ -844,11 +910,12 @@ def _parse_report_request(message: str):
     raw = (message or "").strip()
     if not raw:
         return None
-    low = _norm(raw)
 
+    low = _norm(raw)
     rng = _detect_date_range(raw)
-    has_prefix = any(low.startswith(p) for p in REPORT_PREFIXES)
-    has_hint = any(h in low for h in _REPORT_HINTS) or ("εξοδ" in low) or ("εσοδ" in low) or ("κιν" in low)
+
+    has_prefix = any(low.startswith(_norm(p)) for p in REPORT_PREFIXES)
+    has_hint = any(h in low for h in _REPORT_HINTS)
 
     if not (has_prefix or has_hint or rng):
         return None
@@ -862,22 +929,28 @@ def _parse_report_request(message: str):
     if rng:
         date_from, date_to = rng
 
-    if not date_from and (("μηνα" in low) or ("μήνα" in (message or "")) or ("month" in low)):
-        m = re.search(r"\b(\d{4}-\d{2})\b", low)
-        if m:
-            rng2 = _month_range(m.group(1))
+    # Month default (αν γράψει “του μήνα” χωρίς range)
+    if not date_from and ("μηνα" in low or "month" in low):
+        m2 = re.search(r"\b(\d{4}-\d{2})\b", low)
+        if m2:
+            rng2 = _month_range(m2.group(1))
         else:
             today = date.today()
             rng2 = _month_range(f"{today.year:04d}-{today.month:02d}")
         if rng2:
             date_from, date_to = rng2
 
+    # Default: today
     if not date_from:
         today = date.today()
-        rng3 = _month_range(f"{today.year:04d}-{today.month:02d}")
-        date_from, date_to = rng3
+        date_from, date_to = today.isoformat(), today.isoformat()
 
-    return {"entry_type": entry_type, "property_slug": property_slug, "date_from": date_from, "date_to": date_to}
+    return {
+        "entry_type": entry_type,
+        "property_slug": property_slug,
+        "date_from": date_from,
+        "date_to": date_to
+    }
 
 
 def handle_report_in_chat(public_id: str, message: str):
@@ -888,7 +961,7 @@ def handle_report_in_chat(public_id: str, message: str):
     rows = finance_list(
         limit=50000,
         property_slug=req["property_slug"],
-        entry_type=req["entry_type"],
+        entry_type=req["entry_type"],  # "expense"/"income"/None
         date_from=req["date_from"],
         date_to=req["date_to"],
     )
@@ -937,10 +1010,6 @@ def handle_report_in_chat(public_id: str, message: str):
 
     return {"reply": "\n".join(reply_lines), "download_url": download_url}
 
-
-# ---------------------------
-# Public UI (HTML)
-# ---------------------------
 PUBLIC_CHAT_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1214,7 +1283,7 @@ PUBLIC_CHAT_HTML = r"""<!doctype html>
       if (data && data.download_url) {
         try {
           setStatus("Downloading report CSV...");
-          await downloadWithAuth(data.download_url, `report_${publicId}`);
+          await downloadWithAuth(data.download_url, "report");
           appendLog("Report CSV downloaded.", "bot");
         } catch (e) {
           appendLog("ERROR: " + (e && e.message ? e.message : String(e)), "err");
@@ -1238,7 +1307,7 @@ PUBLIC_CHAT_HTML = r"""<!doctype html>
 
     try {
       setStatus("Downloading CSV...");
-      await downloadWithAuth(`/p/${publicId}/export.csv`, `finance_${publicId}`);
+      await downloadWithAuth(`/p/${publicId}/export.csv`, "finance_entries");
       setStatus("CSV downloaded.");
     } catch (e) {
       setStatus("CSV download failed.", true);
@@ -1574,11 +1643,11 @@ def public_chat(public_id):
 
         # If user is replying to category question
         if pending.get("awaiting_category"):
-            chosen = _parse_category_reply(message)
+            chosen = _parse_category_reply(message, cfg)
             if chosen is None:
                 pending["awaiting_category"] = True
                 finance_pending_upsert(public_id, client_id, pending)
-                return jsonify(reply=_ask_category())
+                return jsonify(reply=_ask_category(cfg))
 
             pending["category"] = chosen
             fields["category"] = chosen  # για να μη στο πατήσει πιο κάτω
@@ -1673,14 +1742,14 @@ def public_chat(public_id):
             finance_pending_upsert(public_id, client_id, pending)
             return jsonify(reply=_ask_next_missing(miss))
 
-        # D) Ask category if still uncategorized (before finalize) – ONLY ONCE
+        # Ask category if still uncategorized (before finalize) – ONLY ONCE
         cat_now = (pending.get("category") or "").strip().lower()
         if cat_now in ("", "uncategorized") and not pending.get("awaiting_category") and not pending.get("skip_category"):
             pending["awaiting_category"] = True
             if not (pending.get("merchant_token") or "").strip():
                 pending["merchant_token"] = _extract_map_token(pending.get("raw_text") or message.strip())
             finance_pending_upsert(public_id, client_id, pending)
-            return jsonify(reply=_ask_category())
+            return jsonify(reply=_ask_category(cfg))
 
         entry = {
             "id": str(uuid.uuid4()),
@@ -1761,6 +1830,8 @@ def finance_delete(public_id):
 
     data = request.get_json(silent=True) or {}
     entry_id = (data.get("id") or "").strip()
+    # hardening: handle quotes/spaces pasted by users
+    entry_id = entry_id.strip().strip('"').strip("'").strip()
     confirm = data.get("confirm") is True
 
     if not entry_id or not confirm:
