@@ -9,6 +9,7 @@ import unicodedata
 from io import StringIO
 from pathlib import Path
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from collections import defaultdict, deque
 from functools import wraps
 from typing import Optional, Dict, Any, List
@@ -250,6 +251,19 @@ if DATABASE_URL:
     ensure_finance_pending_schema()
 
 
+def _json_safe(x):
+    """Convert non-JSON-serializable types to JSON-safe types."""
+    if isinstance(x, (datetime, date)):
+        return x.isoformat()
+    if isinstance(x, Decimal):
+        return float(x)
+    if isinstance(x, dict):
+        return {k: _json_safe(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+    return x
+
+
 def finance_pending_get(public_id: str, client_id: str):
     ensure_finance_pending_schema()
     con = _finance_conn()
@@ -263,7 +277,14 @@ def finance_pending_get(public_id: str, client_id: str):
     if not row:
         return None
     try:
-        return json.loads(row["data"])
+        d = row["data"]
+        # Handle case where data is already a string (legacy or manual insert)
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except Exception:
+                pass
+        return d or {}
     except Exception:
         return None
 
@@ -273,7 +294,9 @@ def finance_pending_upsert(public_id: str, client_id: str, data: dict):
     con = _finance_conn()
     if not con:
         return
-    payload = json.dumps(data, ensure_ascii=False)
+    # Convert non-JSON-serializable types to JSON-safe types
+    safe = _json_safe(data or {})
+    payload = json.dumps(safe, ensure_ascii=False)
     with con:
         with con.cursor() as cur:
             cur.execute(
@@ -373,6 +396,24 @@ def _norm(s: str) -> str:
     s = _strip_accents(s)
     s = re.sub(r"\s+", " ", s)
     return s
+
+
+def _is_cancel_msg(text: str) -> bool:
+    """Check if message is a cancel command (robust substring match)."""
+    t = _strip_accents(text or "").lower().strip()
+    # robust: substring match (πιάνει "ακυρο", "ακυρο.", "ακυρο ✅")
+    return any(w in t for w in ("ακυρο", "ακυρω", "cancel", "reset", "clear"))
+
+
+def _detect_property_slug(text: str) -> str | None:
+    t = _strip_accents(text or "").lower()
+    # thessaloniki
+    if "thessaloniki" in t or "thessalon" in t or "θεσσαλον" in t or "σαλον" in t:
+        return "thessaloniki"
+    # vourvourou
+    if "vourvourou" in t or "βουρβουρ" in t or "βουρβουρου" in t or "vourvour" in t:
+        return "vourvourou"
+    return None
 
 
 def merchant_map_guess_category(text: str):
@@ -686,6 +727,7 @@ def parse_finance_fields(text: str) -> dict:
     cat = _detect_category(text)
     et = _detect_type(text)
     amt = _detect_amount(text)
+    prop = _detect_property_slug(text)
 
     # Heuristic defaults:
     # - rental_income implies income even if user didn't say "εισπραξα"
@@ -696,9 +738,13 @@ def parse_finance_fields(text: str) -> dict:
         elif amt is not None:
             et = "expense"
 
+    # Fallback to existing _detect_property if _detect_property_slug didn't find anything
+    if prop is None:
+        prop = _detect_property(text)
+
     return {
         "entry_type": et,
-        "property_slug": _detect_property(text),
+        "property_slug": prop,
         "amount": amt,
         "entry_date": _detect_date(text),
         "category": cat,
@@ -1320,8 +1366,7 @@ PUBLIC_CHAT_HTML = r"""<!doctype html>
     const key = requiresKey ? getSavedKey() : "";
     if (requiresKey && !key) { alert("No finance key saved."); return; }
 
-    const prop = (prompt("Property slug? (vourvourou / thessaloniki). Leave empty for global undo.") || "").trim();
-    if (!confirm("Undo last entry" + (prop ? (" for " + prop) : "") + "?")) return;
+    if (!confirm("Are you sure; this removes the last entry")) return;
 
     setStatus("Undoing...");
     try {
@@ -1332,7 +1377,7 @@ PUBLIC_CHAT_HTML = r"""<!doctype html>
           ...(requiresKey ? { "X-FINANCE-KEY": key } : {}),
           "X-CLIENT-ID": clientId
         },
-        body: JSON.stringify({ confirm: true, property_slug: prop || null })
+        body: JSON.stringify({ confirm: true, property_slug: null })
       });
 
       const text = await resp.text();
@@ -1345,7 +1390,15 @@ PUBLIC_CHAT_HTML = r"""<!doctype html>
         return;
       }
 
-      appendLog("Undone: " + (data.undone_id || data.message || "ok"), "bot");
+      if (data && data.deleted_id) {
+        const info = [];
+        if (data.label) info.push(data.label);
+        if (data.amount) info.push(data.amount + "€");
+        if (data.date) info.push(data.date);
+        appendLog("Undone: " + (info.length > 0 ? info.join(" | ") : data.deleted_id), "bot");
+      } else {
+        appendLog("Undone: " + (data.message || "ok"), "bot");
+      }
       setStatus("Undone.");
     } catch (e) {
       setStatus("Network error.", true);
@@ -1619,27 +1672,27 @@ def public_chat(public_id):
 
     # finance_clerk wizard + reports
     if slug == "finance_clerk":
-        # Report intent priority
-        fields = parse_finance_fields(message)
-        is_entryish = looks_like_new_entry(fields) or looks_like_entry_intent(message, fields)
-
-        if not is_entryish:
-            rep = handle_report_in_chat(public_id, message)
-            if rep:
-                return jsonify(rep)
-
-        if _is_greeting(message):
-            return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
-
         client_id = _get_client_id_for_state(public_id)
-        norm_msg = _norm(message)
 
-        if norm_msg in ("ακυρο", "ακυρω", "cancel", "reset", "clear"):
+        # Cancel check - MUST be very early, before any other logic
+        if _is_cancel_msg(message):
             finance_pending_clear(public_id, client_id)
             return jsonify(reply="ΟΚ, ακυρώθηκε η τρέχουσα καταχώρηση ✅")
 
+        # Load pending early (needed for wizard merge even if message is not entryish)
         pending = finance_pending_get(public_id, client_id) or {}
         fields = parse_finance_fields(message)
+
+        # Report intent priority (only if not in wizard)
+        if not pending:
+            is_entryish = looks_like_new_entry(fields) or looks_like_entry_intent(message, fields)
+            if not is_entryish:
+                rep = handle_report_in_chat(public_id, message)
+                if rep:
+                    return jsonify(rep)
+
+            if _is_greeting(message):
+                return jsonify(reply="Γράψε καταχώρηση π.χ. “Πλήρωσα νερό Βουρβουρού 20€ 05/01/2026” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
 
         # If user is replying to category question
         if pending.get("awaiting_category"):
@@ -1682,10 +1735,35 @@ def public_chat(public_id):
         if pending and looks_like_strong_new_entry(message, fields):
             pending = {}
 
+        # Wizard merge: merge reply/fields into pending (runs BEFORE "Δεν το έπιασα..." check)
+        # This is critical for wizard replies like "Θεσσαλονίκη" that are not "entryish"
+        if pending:
+            changed = False
+            # 1) Property from reply (Greek or ASCII) - try parsed first, then detect
+            prop = fields.get("property_slug") or _detect_property_slug(message or "")
+            if prop and not (pending.get("property_slug") or "").strip():
+                pending["property_slug"] = prop
+                changed = True
+
+            # 2) Merge other parsed fields only if missing (do not overwrite existing pending)
+            for k in ("entry_date", "entry_type", "amount", "currency", "category", "label", "note"):
+                v = fields.get(k)
+                if v and not pending.get(k):
+                    pending[k] = v
+                    changed = True
+
+            # 3) Persist pending if we changed anything
+            if changed:
+                finance_pending_upsert(public_id, client_id, pending)
+
         date_in_msg = bool(_DATE_RE.search(message))
         is_entryish = looks_like_new_entry(fields) or looks_like_entry_intent(message, fields)
 
         if not pending:
+            # Second safety: guard against cancel being caught by "Δεν το έπιασα..." return
+            if _is_cancel_msg(message):
+                finance_pending_clear(public_id, client_id)
+                return jsonify(reply="ΟΚ, ακυρώθηκε η τρέχουσα καταχώρηση ✅")
             if not is_entryish:
                 return jsonify(reply="Δεν το έπιασα σαν καταχώρηση. Π.χ. “Νερό Βουρβουρού 20€” ή “Airbnb 300€” ή “Δώσε μου έξοδα από 6/1/2026 έως 8/1/2026”.")
             pending = {
@@ -1701,11 +1779,9 @@ def public_chat(public_id):
                 "skip_category": False,
             }
         else:
-            # fill missing pieces
+            # fill missing pieces (additional merge for existing pending)
             if not pending.get("entry_type") and fields.get("entry_type"):
                 pending["entry_type"] = fields["entry_type"]
-            if not pending.get("property_slug") and fields.get("property_slug"):
-                pending["property_slug"] = fields["property_slug"]
             if pending.get("amount") is None and fields.get("amount") is not None:
                 pending["amount"] = fields["amount"]
             if date_in_msg:
@@ -1796,25 +1872,29 @@ def finance_undo_last(public_id):
 
     try:
         with con:
-            with con.cursor() as cur:
+            with con.cursor(cursor_factory=RealDictCursor) as cur:
                 if property_slug:
                     cur.execute(
-                        "SELECT id FROM finance_entries WHERE property_slug=%s ORDER BY created_at DESC LIMIT 1",
+                        "SELECT id, label, amount, entry_date FROM finance_entries WHERE property_slug=%s ORDER BY created_at DESC LIMIT 1",
                         (property_slug,),
                     )
                 else:
-                    cur.execute("SELECT id FROM finance_entries ORDER BY created_at DESC LIMIT 1")
+                    cur.execute("SELECT id, label, amount, entry_date FROM finance_entries ORDER BY created_at DESC LIMIT 1")
 
                 row = cur.fetchone()
                 if not row:
                     return jsonify(ok=True, message="Nothing to undo")
 
-                entry_id = row[0]
+                entry_id = row["id"]
+                entry_label = row.get("label") or ""
+                entry_amount = float(row.get("amount") or 0)
+                entry_date = str(row.get("entry_date") or "")
+                
                 cur.execute("DELETE FROM finance_entries WHERE id=%s", (entry_id,))
                 if cur.rowcount == 0:
                     return jsonify(ok=True, message="Nothing to undo")
 
-        return jsonify(ok=True, undone_id=entry_id, property_slug=property_slug)
+        return jsonify(ok=True, deleted_id=entry_id, label=entry_label, amount=entry_amount, date=entry_date)
     finally:
         try:
             con.close()
